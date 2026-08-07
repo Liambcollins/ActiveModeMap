@@ -1,0 +1,12 @@
+# core (cross-platform)
+numpy>=1.22
+scipy>=1.8
+scikit-learn>=1.0
+matplotlib>=3.5
+# offline data handling / notebooks
+pandas>=1.4
+jupyter
+# instrument PC only (Windows + Igor Pro):
+#   pywin32
+#   igor2
+#   pillow

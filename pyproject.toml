@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "activemodemap"
+version = "0.1.0"
+description = "Rapid mode-shape mapping in dynamic AFM by active learning"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.22", "scipy>=1.8", "scikit-learn>=1.0", "matplotlib>=3.5"]
+
+[tool.setuptools]
+packages = ["activemodemap"]
