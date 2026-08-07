@@ -5,3 +5,6 @@ __pycache__/
 *.npz
 build/
 dist/
+
+# manuscript draft kept local, not version-controlled
+paper/
