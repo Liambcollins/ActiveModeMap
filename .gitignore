@@ -8,3 +8,5 @@ dist/
 
 # manuscript draft kept local, not version-controlled
 paper/
+commit_activemodemap_fixes.sh
+commit_activemodemap_fixes.ps1

@@ -1,0 +1,28 @@
+# Normalise line endings so the whole tree stops showing as modified.
+#
+# The repo was committed with LF in the index but checked out / edited with CRLF
+# in the working tree, and with core.autocrlf unset git flagged all 24 files as
+# changed even when only the line endings differed. `* text=auto` makes git store
+# LF in the index and convert on checkout, so this cannot recur.
+* text=auto
+
+# Explicitly text, so diffs stay readable
+*.py     text
+*.md     text
+*.txt    text
+*.toml   text
+*.cfg    text
+*.ipynb  text
+
+# Binary — never touch these
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.tif    binary
+*.tiff   binary
+*.ibw    binary
+*.npz    binary
+*.pdf    binary
+*.docx   binary
+*.xlsx   binary
+*.pptx   binary
