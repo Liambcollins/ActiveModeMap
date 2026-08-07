@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.jpg" alt="ActiveModeMap — active learning for rapid mode-shape mapping in dynamic AFM: sparse detection positions recover the full position–frequency mode-shape map" width="100%">
+</p>
+
 # ActiveModeMap
 
 **Rapid mode-shape mapping in dynamic AFM by active learning.**
