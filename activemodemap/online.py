@@ -380,16 +380,314 @@ def dense_reference_sweep(instrument, x_um, verbose=True, enforce_limits=True,
     return np.asarray(xs)[o], common, np.asarray(Zs)[o]
 
 
-def compare_to_dense(mm, rec, x_dense, F_dense, Z_dense, dns_band_Hz=None):
+# --------------------------------------------------------------------------- #
+#  Position-scale correction                                                  #
+# --------------------------------------------------------------------------- #
+class PositionScale:
+    """Affine repair of a position axis: ``x_true = scale * x_logged + offset``.
+
+    `DoLDMove` under-delivers on small steps, so a sweep made of many short
+    relative moves travels less than its axis says. On Demo6Fullgrid a dense
+    pass of 280 chained 0.5 µm steps covered only ~85% of its commanded 140 µm,
+    which put its labelled x = 85 µm about 25 µm away from the sparse pass's
+    x = 85 µm. Comparing the two on their logged axes is therefore comparing
+    different places on the cantilever.
+
+    `scale == 1.0` and `offset == 0.0` is the identity, i.e. "no correction" —
+    use `PositionScale.identity()` to say that explicitly.
+
+    Attributes other than scale/offset are fit diagnostics and are None for a
+    hand-built instance.
+    """
+
+    def __init__(self, scale=1.0, offset=0.0, n_used=None, resid_um=None,
+                 excluded_x_um=None, matched=None, source="manual"):
+        self.scale = float(scale)
+        self.offset = float(offset)
+        self.n_used = n_used
+        self.resid_um = resid_um
+        self.excluded_x_um = excluded_x_um
+        self.matched = matched
+        self.source = source
+
+    @classmethod
+    def identity(cls):
+        return cls(1.0, 0.0, source="identity")
+
+    @classmethod
+    def from_scale(cls, scale, anchor_um):
+        """A travel shortfall of `scale`, accumulated away from `anchor_um`.
+
+        This — not `offset=0` — is the physically meaningful one-parameter form.
+        A sweep is parked somewhere, usually the free end, and the shortfall
+        builds up as it steps away, so the axis is correct at the anchor and
+        wrong in proportion to the distance travelled from it. Writing
+        ``x_true = scale * x`` instead pivots about x = 0, i.e. about the
+        clamped base, which no sweep is anchored to: with scale 0.85 that moves
+        a correct 225 µm point by 34 µm and is simply a different (wrong) claim.
+        """
+        anchor_um = float(anchor_um)
+        return cls(scale, anchor_um * (1.0 - float(scale)),
+                   source=f"scale about {anchor_um:.1f}um")
+
+    @property
+    def is_identity(self):
+        return self.scale == 1.0 and self.offset == 0.0
+
+    @property
+    def rms_um(self):
+        if self.resid_um is None or len(self.resid_um) == 0:
+            return None
+        return float(np.sqrt(np.mean(np.asarray(self.resid_um) ** 2)))
+
+    def apply(self, x_um):
+        """Logged positions -> corrected positions."""
+        return self.scale * np.asarray(x_um, float) + self.offset
+
+    def invert(self, x_true_um):
+        """Corrected positions -> the logged positions that produced them."""
+        return (np.asarray(x_true_um, float) - self.offset) / self.scale
+
+    def __repr__(self):
+        r = self.rms_um
+        tail = "" if r is None else f", n={self.n_used}, rms={r:.2f}um"
+        return (f"PositionScale(scale={self.scale:.4f}, "
+                f"offset={self.offset:+.2f}um, source={self.source}{tail})")
+
+
+def _xv(records, x_key="position_x_um", invols_key="invols_m_per_V"):
+    """(x, invols) arrays from a record list, a DataFrame, or a 2-tuple."""
+    if isinstance(records, (tuple, list)) and len(records) == 2 \
+            and np.ndim(records[0]) == 1 and not isinstance(records[0], dict):
+        x, v = records
+    elif hasattr(records, "columns"):                       # DataFrame
+        x, v = records[x_key].values, records[invols_key].values
+    else:                                                   # sequence of dicts
+        rs = [r for r in records if r is not None]
+        x = [r[x_key] for r in rs]
+        v = [r[invols_key] for r in rs]
+    x = np.asarray(x, float)
+    v = np.asarray(v, float)
+    good = np.isfinite(x) & np.isfinite(v) & (v > 0)
+    return x[good], v[good]
+
+
+def fit_position_scale(sparse_records, dense_records, smooth=9, min_points=3,
+                       x_key="position_x_um", invols_key="invols_m_per_V",
+                       verbose=True):
+    """Recover a dense sweep's true position axis from its own InvOLS log.
+
+    The optical-lever sensitivity is a steep, monotonic function of where the
+    spot actually sits on the beam — a factor ~5 from free end to base on a
+    Multi75E-G — and `AsylumInstrument` already measures it at every position of
+    every pass. That makes InvOLS a position ruler that costs nothing extra:
+    a pass built from a few large moves is the trustworthy reference, and the
+    scale factor that maps the dense pass's InvOLS-vs-position curve onto it is
+    the travel shortfall.
+
+    Method: invert the (monotonised) dense log-InvOLS curve to find, for each
+    sparse point, the dense LABEL carrying the same sensitivity, then regress
+    the sparse labels on those matched dense labels. Regressing rather than
+    averaging per-point ratios keeps the support fixed as the fit moves, and
+    hands back an offset as well as a scale.
+
+    Sparse points whose InvOLS lies outside the dense pass's InvOLS range are
+    outside the dense pass's true coverage and are excluded — on Demo6 that
+    correctly drops x = 85 and 85.5 µm, which the dense sweep never reached.
+
+    Validated on Demo6Fullgrid: scale 0.8466 with 0.65 µm rms residuals over 7
+    points, against 0.8505 ± 0.0031 measured independently from the FAMap
+    optical images — 0.5% agreement, and stable over smooth = 1..25.
+
+    Parameters
+    ----------
+    sparse_records, dense_records
+        Record lists (`AsylumInstrument.records`), DataFrames of the saved log
+        CSVs, or `(x_um, invols_m_per_V)` array pairs. The FIRST argument is the
+        reference frame — pass the pass made of few large moves.
+    smooth : int
+        Running-median width applied to dense log-InvOLS before monotonising.
+    min_points : int
+        Refuse to fit below this many usable sparse points.
+
+    Returns
+    -------
+    PositionScale
+
+    Raises
+    ------
+    ValueError
+        If fewer than `min_points` sparse points can be matched. That means the
+        two passes' InvOLS ranges barely overlap, which is itself a red flag —
+        do not paper over it with a fabricated scale.
+    """
+    xs, vs = _xv(sparse_records, x_key, invols_key)
+    xd, vd = _xv(dense_records, x_key, invols_key)
+    if xs.size < min_points or xd.size < 3:
+        raise ValueError(
+            f"need >= {min_points} sparse and >= 3 dense InvOLS records, "
+            f"got {xs.size} and {xd.size}")
+
+    o = np.argsort(xd)
+    X, V = xd[o], np.log(vd[o])
+    if smooth and smooth > 1:                     # kill per-point measurement noise
+        k = int(smooth) // 2
+        V = np.array([np.median(V[max(0, i - k):i + k + 1]) for i in range(V.size)])
+    V = np.minimum.accumulate(V)                  # InvOLS falls toward the free end
+    Xi, Vi = X[::-1], V[::-1]                     # np.interp needs increasing x
+
+    ls = np.log(vs)
+    inside = (ls >= Vi.min()) & (ls <= Vi.max())
+    if int(inside.sum()) < min_points:
+        raise ValueError(
+            f"only {int(inside.sum())} of {xs.size} reference positions have an "
+            f"InvOLS inside the dense pass's range "
+            f"[{np.exp(Vi.min()):.3g}, {np.exp(Vi.max()):.3g}] m/V — the two "
+            "passes barely overlap, so no scale can be fitted. Check that both "
+            "passes really covered the same part of the beam.")
+
+    xd_match = np.interp(ls[inside], Vi, Xi)
+    A = np.polyfit(xd_match, xs[inside], 1)
+    resid = xs[inside] - np.polyval(A, xd_match)
+    ps = PositionScale(
+        scale=A[0], offset=A[1], n_used=int(inside.sum()), resid_um=resid,
+        excluded_x_um=xs[~inside],
+        matched=list(zip(np.round(xd_match, 2), np.round(xs[inside], 2))),
+        source="invols")
+    if verbose:
+        print(f"  position scale from InvOLS: {ps}")
+        if abs(ps.scale - 1.0) > 0.02:
+            print(f"    dense axis is compressed {100 * (1 - ps.scale):.1f}% — its "
+                  f"span is really {ps.scale * (xd.max() - xd.min()):.1f} um, not "
+                  f"{xd.max() - xd.min():.1f} um")
+        if ps.excluded_x_um.size:
+            print(f"    excluded {np.round(ps.excluded_x_um, 1)} um (InvOLS outside "
+                  "the dense pass's range -> never actually covered by it)")
+        if ps.rms_um is not None and ps.rms_um > 3.0:
+            print(f"    WARNING: {ps.rms_um:.1f} um rms is large for an affine fit; "
+                  "the error may not be a simple scale (check for drift).")
+    return ps
+
+
+def fit_position_scale_optical(images, x_um, spot_window_px=(690, 775),
+                               search_px=(120, 700), verbose=True):
+    """Independent cross-check on `fit_position_scale`, from the FAMap images.
+
+    `_goto_and_prepare` saves an optical frame at every position. The laser spot
+    is fixed in the frame (camera and detection optics move together) while the
+    cantilever translates, so the spot-to-base-edge distance in pixels IS the
+    spot's distance along the beam. Regressing it on the logged x gives
+    px-per-commanded-µm; run this on both passes and the RATIO of the two slopes
+    is the relative travel shortfall, with no pixel calibration needed.
+
+    Used to validate the InvOLS method on Demo6Fullgrid: 0.8505 ± 0.0031 here
+    (stable over six edge-detection variants) vs 0.8466 from InvOLS.
+
+    Returns ``dict(slope_px_per_um, spot_px, base_px, dist_px, resid_px)``.
+    Take the ratio of `slope_px_per_um` between two passes yourself, then build
+    the correction with `PositionScale.from_scale(ratio, anchor)`.
+
+    Needs Pillow. Returns None if it cannot read the images.
+    """
+    try:
+        from PIL import Image
+        Image.MAX_IMAGE_PIXELS = None
+    except Exception as e:                                  # pragma: no cover
+        print(f"  optical scale check unavailable ({e})")
+        return None
+    x_um = np.asarray(x_um, float)
+    spot, base = [], []
+    for p in images:
+        a = np.asarray(Image.open(p).convert("L"), dtype=float)
+        r0 = int(np.argmax(a[:, 350:650].mean(1)))          # the bright beam row
+        band = a[max(0, r0 - 25):r0 + 26, :].mean(0)
+        s0, s1 = spot_window_px
+        seg = band[s0:s1]
+        w = np.clip(seg - np.percentile(band[s1 + 5:s1 + 130], 50), 0, None)
+        spot.append(s0 + (np.arange(seg.size) * w).sum() / max(w.sum(), 1e-9))
+        g0, g1 = search_px
+        reg = band[g0:g1]
+        i = int(np.argmax(np.gradient(reg)))                # steepest rise = base edge
+        lo = np.percentile(reg[max(0, i - 60):max(1, i - 20)], 50)
+        hi = np.percentile(reg[i + 20:i + 60], 50)
+        lvl = 0.5 * (lo + hi)
+        j = i
+        while j > 0 and reg[j] > lvl:
+            j -= 1
+        base.append(g0 + j + (lvl - reg[j]) / (reg[j + 1] - reg[j]))
+    spot = np.asarray(spot); base = np.asarray(base)
+    dist = spot - base
+    A = np.polyfit(x_um, dist, 1)
+    resid = dist - np.polyval(A, x_um)
+    if verbose:
+        print(f"  optical: {A[0]:.4f} px per commanded um over {x_um.size} images, "
+              f"residual rms {np.sqrt((resid ** 2).mean()):.1f} px")
+    return dict(slope_px_per_um=float(A[0]), intercept_px=float(A[1]),
+                spot_px=spot, base_px=base, dist_px=dist, resid_px=resid)
+
+
+def peak_in_band(freq_Hz, Z, band_Hz=None):
+    """Per-position peak |Z| in a band, and the frequency it occurred at.
+
+    The f_res-shift-insensitive alternative to reading |Z| at one fixed
+    frequency. On Demo6 the contact resonance wandered 386.9-387.9 kHz between
+    positions while the linewidth was only ~1.3-2.8 kHz, so a fixed cut sampled
+    a different part of every peak and turned position-to-position f_res jitter
+    into fake amplitude structure (it accounted for a 1.46x -> 1.18x chunk of
+    the apparent sparse/dense mismatch). Compare peaks, not cuts.
+    """
+    f = np.asarray(freq_Hz, float)
+    Z = np.atleast_2d(np.asarray(Z, complex))
+    m = np.ones(f.size, bool) if band_Hz is None else \
+        (f >= float(band_Hz[0])) & (f <= float(band_Hz[1]))
+    if m.sum() < 3:
+        raise ValueError(f"band {band_Hz} keeps only {int(m.sum())} of {f.size} points")
+    A = np.abs(Z[:, m])
+    i = A.argmax(1)
+    return A.max(1), f[m][i]
+
+
+def compare_to_dense(mm, rec, x_dense, F_dense, Z_dense, dns_band_Hz=None,
+                     position_scale=None, sparse_records=None,
+                     dense_records=None, restrict_to_overlap=True,
+                     amp_band_Hz=None):
     """Score the sparse reconstruction against a dense reference sweep.
 
     Returns a dict with the dense D-NS, the sparse D-NS, their difference, and
     the per-position relative map error. The dense sweep is interpolated onto
     `mm.freq` if the windows differ.
+
+    Position-axis repair
+    --------------------
+    A dense sweep made of many short `DoLDMove` steps does not travel as far as
+    its axis claims, so by default this refuses to compare the two passes on
+    their logged axes alone. Supply ONE of:
+
+    * `position_scale` — a `PositionScale`, or a float read as a pure scale, or
+      `PositionScale.identity()` to assert deliberately that no correction is
+      wanted;
+    * `sparse_records` and `dense_records` — the two passes' record lists (or
+      log DataFrames), and the scale is fitted from their InvOLS via
+      `fit_position_scale`.
+
+    Everything positional — the dense D-NS, the branch crossings, the
+    reconstruction sampling — is then computed on the CORRECTED axis, because a
+    D-NS read off a 15%-compressed axis is wrong by 15% of its distance from the
+    anchor. The uncorrected values are returned alongside as `*_raw` so the size
+    of the repair stays visible.
+
+    With `restrict_to_overlap` (default), dense positions whose corrected value
+    falls outside the sparse grid are dropped rather than silently extrapolated
+    — on Demo6 the dense pass's real coverage stopped ~110 µm, so comparing it
+    against sparse points at 85 µm was extrapolation dressed up as disagreement.
+
+    Amplitude comparison uses `peak_in_band` over `amp_band_Hz` (defaults to the
+    D-NS band), not a fixed-frequency cut.
     """
     import numpy as np
     from .lowrank import (resonance_index, dns_from_map, band_mask, dns_branch)
 
+    x_dense = np.asarray(x_dense, float)
     Z = np.asarray(Z_dense, complex)
     if F_dense.shape != mm.freq.shape or not np.allclose(F_dense, mm.freq):
         Z = np.array([np.interp(mm.freq, F_dense, z.real)
@@ -398,18 +696,75 @@ def compare_to_dense(mm, rec, x_dense, F_dense, Z_dense, dns_band_Hz=None):
     bm = band_mask(mm.freq, band) if band else np.ones(mm.freq.size, bool)
     fb = mm.freq[bm]
 
-    ires_d = resonance_index(fb, Z[:, bm])
-    dns_dense = dns_from_map(x_dense, Z[:, bm], fb, ires_d)
-    cross_dense, _ = dns_branch(x_dense, Z[:, bm], fb, ires_d)
+    # -- resolve the position correction ---------------------------------- #
+    if position_scale is None:
+        if sparse_records is not None and dense_records is not None:
+            position_scale = fit_position_scale(sparse_records, dense_records)
+        else:
+            raise ValueError(
+                "compare_to_dense needs a position axis it can trust. Pass "
+                "position_scale=..., or sparse_records=/dense_records= to fit "
+                "it from InvOLS, or position_scale=PositionScale.identity() to "
+                "state that the two passes are known to share an axis. A dense "
+                "sweep built from many small DoLDMove steps generally does NOT "
+                "share an axis with a sparse pass built from large ones.")
+    if np.isscalar(position_scale):
+        # A bare float means "the sweep under-travelled by this factor", and the
+        # shortfall accumulates from wherever it started -- the largest x here,
+        # since these sweeps park at the free end and step inward. Anchoring at
+        # x = 0 instead would move the free end by tens of microns.
+        anchor = float(np.max(x_dense))
+        position_scale = PositionScale.from_scale(float(position_scale), anchor)
+        print(f"  position_scale={position_scale.scale:.4f} read as a shortfall "
+              f"accumulating from x={anchor:.1f} um -> {position_scale}")
+    xc = position_scale.apply(x_dense)
 
-    # sparse reconstruction sampled at the dense positions
-    idx = [int(np.argmin(np.abs(mm.x_grid - x))) for x in x_dense]
+    # -- dense estimators, on the corrected axis -------------------------- #
+    ires_d = resonance_index(fb, Z[:, bm])
+    dns_dense = dns_from_map(xc, Z[:, bm], fb, ires_d)
+    cross_dense, _ = dns_branch(xc, Z[:, bm], fb, ires_d)
+    dns_dense_raw = dns_from_map(x_dense, Z[:, bm], fb, ires_d)
+
+    # -- overlap with the sparse grid -------------------------------------- #
+    lo, hi = float(mm.x_grid.min()), float(mm.x_grid.max())
+    keep = np.ones(xc.size, bool) if not restrict_to_overlap else \
+        (xc >= lo - 1e-9) & (xc <= hi + 1e-9)
+    n_drop = int((~keep).sum())
+    if n_drop:
+        print(f"  dropped {n_drop} of {xc.size} dense positions: corrected "
+              f"positions outside the sparse grid [{lo:.1f}, {hi:.1f}] um. "
+              "Comparing there would be extrapolation, not disagreement.")
+    if not keep.any():
+        raise ValueError(
+            "after correction NO dense position lies inside the sparse grid — "
+            "the two passes did not cover the same part of the beam.")
+
+    idx = [int(np.argmin(np.abs(mm.x_grid - x))) for x in xc[keep]]
     Zr = rec["Zrec"][idx]
-    rel = np.abs(Zr - Z).mean(1) / (np.abs(Z).mean(1) + 1e-30)
+    Zk = Z[keep]
+    rel = np.abs(Zr - Zk).mean(1) / (np.abs(Zk).mean(1) + 1e-30)
+
+    # -- amplitude, peak-in-band rather than a fixed cut ------------------- #
+    ab = amp_band_Hz or band
+    pk_d, fpk_d = peak_in_band(mm.freq, Zk, ab)
+    pk_r, fpk_r = peak_in_band(mm.freq, Zr, ab)
+    ratio = pk_r / np.where(pk_d == 0, np.nan, pk_d)
 
     return dict(dns_dense=dns_dense, crossings_dense=cross_dense,
                 dns_sparse=rec["dns"], delta=rec["dns"] - dns_dense,
+                dns_dense_raw=dns_dense_raw,
+                delta_raw=rec["dns"] - dns_dense_raw,
+                position_scale=position_scale,
+                x_dense=x_dense[keep], x_dense_corrected=xc[keep],
+                x_dense_all=x_dense, x_dense_corrected_all=xc,
+                kept=keep, n_dropped=n_drop,
                 rel_err=rel, rel_err_mean=float(rel.mean()),
-                rel_err_max=float(rel.max()), x_dense=x_dense,
-                Z_dense_on_grid=Z, ires_dense=int(np.flatnonzero(bm)[ires_d]),
-                n_sparse=mm.n, n_dense=len(x_dense))
+                rel_err_max=float(rel.max()),
+                peak_dense=pk_d, peak_sparse=pk_r,
+                peak_freq_dense=fpk_d, peak_freq_sparse=fpk_r,
+                peak_ratio=ratio,
+                peak_ratio_median=float(np.nanmedian(ratio)),
+                amp_band_Hz=ab,
+                Z_dense_on_grid=Zk, ires_dense=int(np.flatnonzero(bm)[ires_d]),
+                n_sparse=mm.n, n_dense=int(keep.sum()))
+
