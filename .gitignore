@@ -10,8 +10,8 @@ dist/
 paper/
 commit_activemodemap_fixes.sh
 commit_activemodemap_fixes.ps1
-commit_tune_wait_fix.ps1
 
-# local working backups
-_backup_*/
+# quarantined by the 2026-08-14 study tidy: review the contents, then delete the
+# folder.  Nothing in here is referenced by any script.
 _to_delete/
+compare_to_main.report.txt
