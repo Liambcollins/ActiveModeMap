@@ -133,6 +133,35 @@ def tune_to_complex(tune_data, band_Hz=None, drop_nonfinite=True):
 # --------------------------------------------------------------------------- #
 #  Automation class (adapted from afm_laser_sweep_automation_v4)              #
 # --------------------------------------------------------------------------- #
+def _note_value(note, key):
+    """Numeric value of `key` from an Igor wave note.
+
+    Replaces `float(str(note).split('rInvOLS: ')[1].split('\\')[0])`, which only
+    ever worked by accident: `str(bytes)` renders the note's CR line separators
+    as a literal backslash-r, so the leading 'r' in 'rInvOLS: ' was matching the
+    line break before 'InvOLS: '. It returns the right number on these files, but
+    it silently grabs the wrong line the moment Igor writes LF instead of CR, or
+    a key ending in 'rInvOLS' appears earlier in the note.
+
+    Splits on real line breaks and requires an exact key match, so 'InvOLS' can
+    never pick up 'AmpInvOLS' or 'Amp2InvOLS'.
+    """
+    if isinstance(note, (bytes, bytearray)):
+        note = note.decode('latin-1', 'replace')
+    else:
+        note = str(note)
+    for line in note.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        k, sep, v = line.partition(':')
+        if sep and k.strip() == key:
+            try:
+                return float(v.strip())
+            except ValueError:
+                break
+    raise KeyError(
+        f"key {key!r} not found as a numeric entry in the wave note "
+        f"({len(note)} chars). Do not guess a calibration — check the note.")
+
+
 class AFMLaserSweepAutomation:
     """Automated laser positioning, calibration, engage, and tune on Asylum/Igor."""
 
@@ -146,12 +175,50 @@ class AFMLaserSweepAutomation:
         self.log_filename = log_filename
         self.load_force_setpoint = 0.5
         self.tune_settling_time = 2.0
-        self.invols_bounds = (4e-8, 10e-7)
-        self.use_autowedge = False
+        #: hard cap on how long to wait for a tune to finish (s)
+        self.tune_timeout_s = 180.0
+        #: poll interval while waiting for a tune (s)
+        self.tune_poll_s = 0.4
+        #: consecutive unchanged polls that count as "finished"
+        #: consecutive unchanged polls that count as "finished". At the default
+        #: 0.4 s poll this is a ~2 s quiet window, which is long enough that a
+        #: momentary lull mid-sweep is not mistaken for completion.
+        self.tune_stable_polls = 5
+        #: ABSOLUTE plausibility window (m/V) for a freshly measured InvOLS.
+        #: Only a measurement outside this is refused. This used to be
+        #: (4e-8, 10e-7), and the 1.0e-6 ceiling was BELOW the true InvOLS over
+        #: the base half of a Multi75E-G -- it reaches 2.5e-6 at x ~ 85 um. Every
+        #: such value was silently dropped, so on Demo6Fullgrid the panel InvOLS
+        #: froze at 9.9613e-7 for the last ~170 positions of the dense sweep and
+        #: every physical unit Igor derived there (the saved Deflection channel
+        #: in metres, DeflectionSetpointNewtons, the force display) was wrong by
+        #: up to 2.5x. Keep this wide: it is a sanity check, not a calibration.
+        self.invols_bounds = (1e-8, 1e-5)
+        #: Warn (but still apply) when a new InvOLS differs from the last
+        #: accepted one by more than this factor. Adjacent 0.5 um steps change it
+        #: by well under 1%, so a big jump means a bad force curve or a move that
+        #: did not land -- worth seeing, not worth discarding.
+        self.invols_warn_ratio = 3.0
+        #: Last accepted InvOLS, and a log of rejected measurements, so a run can
+        #: be audited afterwards instead of failing silently.
+        self.last_invols = None
+        self.invols_rejected = []
+        #: Whether to run AutoWedge before each InvOLS measurement. This flag was
+        #: previously ignored -- `_goto_and_prepare` called AutoWedge
+        #: unconditionally, so every run to date (Demo6 included) autowedged at
+        #: every position despite this defaulting to False. It is now honoured;
+        #: the default is True to match what actually ran, so results stay
+        #: comparable with earlier data. Set it False to skip.
+        self.use_autowedge = True
         self.autowedge_pause = 15.0
         self.eigenmode_center_freq = 70000
         #: band (Hz) used when reporting f_res / Q; None = whole tune window
         self.resonance_band_Hz = None
+        #: sample-spot move (GoToSpot) settings
+        self.spot_timeout_s = 90.0
+        self.spot_poll_s = 0.5
+        self.spot_stable_polls = 4
+        self.spot_stable_tol_V = 2e-3
         self.results = []
 
     # -- low-level ------------------------------------------------------- #
@@ -267,22 +334,236 @@ class AFMLaserSweepAutomation:
             defl = file['wave']['wData'][:, 1]
             max_i = np.argmax(defl)
             engage_i = np.argmin(defl[:max_i])
-            curr = float(str(file['wave']['note']).split('rInvOLS: ')[1].split('\\')[0])
+            curr = _note_value(file['wave']['note'], 'InvOLS')
             deflV = defl / curr
             di = max_i - engage_i
             i1 = int(engage_i + 0.25 * di); i2 = int(max_i - 0.25 * di)
             invols = (z[i2] - z[i1]) / (deflV[i2] - deflV[i1])
-            if self.invols_bounds[0] < invols < self.invols_bounds[1]:
+            lo, hi = self.invols_bounds
+            if lo < invols < hi:
+                prev = self.last_invols
+                if prev and (invols / prev > self.invols_warn_ratio
+                             or prev / invols > self.invols_warn_ratio):
+                    print(f"  NOTE: InvOLS jumped {prev:.3e} -> {invols:.3e} m/V "
+                          f"({invols / prev:.2f}x). Applying it, but check the "
+                          "force curve and that the laser move landed.")
                 self.ex('InvOLSSetVar_1', 'MasterPanel', invols)
+                self.last_invols = invols
+            else:
+                # Loud, and recorded. Silently skipping the write-back is what
+                # left half of Demo6Fullgrid on a stale calibration.
+                self.invols_rejected.append(invols)
+                print(f"  WARNING: measured InvOLS {invols:.3e} m/V is outside "
+                      f"invols_bounds ({lo:.1e}, {hi:.1e}) — NOT written to the "
+                      "MasterPanel, which is therefore now STALE. The returned "
+                      "value is still used for the load setpoint. Widen "
+                      "invols_bounds if this value is real.")
             return invols
         except Exception as e:
             print(f"  ERROR loading force curve: {e}")
             return None
 
+    # -- sample spots (GoToSpot / Force panel pick-spot) ------------------- #
+    def read_xy_sensor(self):
+        """(XSensor, YSensor) in volts, read through a scratch wave.
+
+        There is no direct COM call for td_ReadValue, so Execute writes both
+        sensors into a small wave and we read the points back — the same pattern
+        the laser-position code uses with LDX_pos.
+        """
+        self.igor.Execute('Make/O/N=2 root:AMM_XY')
+        self.igor.Execute('root:AMM_XY[0] = td_ReadValue("XSensor")')
+        self.igor.Execute('root:AMM_XY[1] = td_ReadValue("YSensor")')
+        w = self.igor.DataFolder(r"root").Wave("AMM_XY")
+        return (float(w.GetNumericWavePointValue(0)),
+                float(w.GetNumericWavePointValue(1)))
+
+    def goto_spot(self, spot_number, wait=True, verbose=False):
+        """Drive the SAMPLE (scanner) to a spot marked on the current image.
+
+        Spots are the ones picked on an image via the Force panel — they live in
+        root:Packages:MFP3D:Force:SpotX/SpotY, and **index 0 is the scan origin;
+        user-marked spots start at 1**. `GoToSpot()` itself does the offset,
+        scan-angle and LVDT arithmetic and honours GoThereWithdraw, so we only
+        select the spot and start it. Requires the image window with the marked
+        spots to be OPEN in Igor, or GoToSpot raises an alert and does nothing.
+
+        This moves the sample under the tip. It is completely independent of the
+        detection-laser position along the cantilever (DoLDMove), which is
+        untouched.
+
+        Completion is detected by polling the X/Y sensors until they are stable
+        within `spot_stable_tol_V` for `spot_stable_polls` polls — target-free,
+        so it works whichever internal branch GoToSpot takes (direct ramp, or
+        withdraw-then-ramp via its callback). Returns True when the scanner
+        settled, False on timeout.
+        """
+        spot_number = int(spot_number)
+        if spot_number < 1:
+            raise ValueError(
+                "spot_number must be >= 1: index 0 is the scan origin, "
+                "user-marked spots start at 1")
+        self.igor.Execute(f'PV("ForceSpotNumber", {spot_number})')
+        time.sleep(0.2)
+        self.igor.Execute('GoToSpot()')
+        if not wait:
+            return None
+        t0 = time.time()
+        try:
+            prev = self.read_xy_sensor()
+        except Exception as e:
+            print(f"    WARNING: cannot read XY sensors ({e}); "
+                  "using a fixed 10 s wait for the spot move")
+            time.sleep(10.0)
+            return False
+        moved, stable = False, 0
+        while time.time() - t0 < self.spot_timeout_s:
+            time.sleep(self.spot_poll_s)
+            cur = self.read_xy_sensor()
+            d = max(abs(cur[0] - prev[0]), abs(cur[1] - prev[1]))
+            if d > self.spot_stable_tol_V:
+                moved, stable = True, 0
+            else:
+                stable += 1
+                # If it never moved, either the ramp has not started yet (keep
+                # waiting a little) or we were already at the spot (accept).
+                if stable >= self.spot_stable_polls and (
+                        moved or time.time() - t0 > 5.0):
+                    if verbose:
+                        print(f"      spot {spot_number} reached after "
+                              f"{time.time() - t0:.1f} s "
+                              f"(XY = {cur[0]:+.4f}, {cur[1]:+.4f} V)"
+                              + ("" if moved else "  [no motion — already there?]"))
+                    time.sleep(0.5)
+                    return True
+            prev = cur
+        print(f"    WARNING: scanner did not settle within "
+              f"{self.spot_timeout_s:.0f} s of GoToSpot (spot_timeout_s)")
+        return False
+
     # -- tune ------------------------------------------------------------ #
-    def do_tune(self, wait_time=5):
+    def _tune_signature(self, n_probe=48):
+        """Fingerprint of the current tune waves, for change detection.
+
+        One coarse pass over the Amp wave gives both signals at no extra cost:
+
+        * **how many probed points are finite** -- Igor NaN-fills the part of the
+          tune it has not swept yet, so this count rises monotonically with sweep
+          progress. This is the primary signal, and it does not care which
+          direction the sweep runs: an earlier version binary-searched for a
+          single NaN boundary assuming finite-at-index-0, which silently degrades
+          to nothing if Igor sweeps high-to-low or leaves a permanently NaN tail
+          (as these tunes do above ~950 kHz).
+        * **the values themselves** -- the fallback for configurations that do not
+          NaN-pad at all.
+
+        Sampled values alone are NOT sufficient: most probes land in the un-swept
+        NaN region and read constant, so the fingerprint looks stable while the
+        sweep is ~10% done. An earlier version did exactly that and called a 30 s
+        tune finished after 3 s. Keep the probe count and `tune_stable_polls`
+        generous.
+        """
+        try:
+            df = self.igor.DataFolder(r"root:packages:MFP3D:Tune")
+            aw, pw = df.Wave("Amp"), df.Wave("Phase")
+            n = self._wave_npnts(aw)
+            if n < 2:
+                return None
+            step = max(n // n_probe, 1)
+            idx = list(range(0, n, step))
+            vals = [aw.GetNumericWavePointValue(i) for i in idx]
+            n_finite = sum(1 for v in vals if v == v)          # NaN != NaN
+            # a few phase points too, so a phase-only update still registers
+            pv = [pw.GetNumericWavePointValue(i) for i in idx[::8]]
+            enc = tuple(("nan" if v != v else round(float(v), 12))
+                        for v in (vals + pv))
+            return (n, n_finite, enc)
+        except Exception:
+            return None
+
+    def wait_for_tune(self, timeout_s=None, poll_s=None, stable_polls=None,
+                      start_timeout_s=15.0, verbose=False):
+        """Block until the Igor tune has actually finished.
+
+        `igor.Execute('CanttuneFunc("DoTuneOnceButton")')` only *starts* the
+        tune -- Igor runs the sweep as a background task and returns immediately.
+        The original code simply slept for a fixed few seconds, which is fine for
+        a short tune and silently wrong for a long one: the spectrum gets saved
+        mid-sweep, and the caller moves on to change bias or load while the tune
+        is still running.
+
+        So poll instead. Two phases, because either alone is unsafe:
+
+        1. **Wait for the waves to CHANGE** (the tune has begun). Without this,
+           a wave left over from the previous tune looks stable straight away and
+           the function returns instantly.
+        2. **Wait for them to STOP changing** for `stable_polls` consecutive
+           polls (the sweep has finished filling them).
+
+        Returns True if completion was observed, False on timeout (the caller
+        should treat that as suspect data, not as success).
+        """
+        timeout_s = self.tune_timeout_s if timeout_s is None else timeout_s
+        poll_s = self.tune_poll_s if poll_s is None else poll_s
+        stable_polls = (self.tune_stable_polls if stable_polls is None
+                        else stable_polls)
+        t0 = time.time()
+        base = self._tune_signature()
+        if base is None:
+            if verbose:
+                print("      cannot read tune waves; falling back to a fixed wait")
+            time.sleep(self.tune_settling_time + 2)
+            return False
+
+        # phase 1: has the tune started?
+        started = False
+        while time.time() - t0 < start_timeout_s:
+            time.sleep(poll_s)
+            sig = self._tune_signature()
+            if sig is not None and sig != base:
+                started = True
+                break
+        if not started and verbose:
+            print(f"      no change in the tune waves within {start_timeout_s:.0f} s "
+                  "— either the tune is very fast or it never started")
+
+        # phase 2: has it stopped changing? Never accept completion before a
+        # minimum quiet window has actually elapsed.
+        min_quiet_s = poll_s * stable_polls
+        prev, stable, last_change = None, 0, time.time()
+        while time.time() - t0 < timeout_s:
+            time.sleep(poll_s)
+            sig = self._tune_signature()
+            if sig is None:
+                continue
+            if prev is not None and sig == prev:
+                stable += 1
+                if (stable >= stable_polls
+                        and time.time() - last_change >= min_quiet_s):
+                    if verbose:
+                        print(f"      tune finished after {time.time() - t0:.1f} s")
+                    time.sleep(self.tune_settling_time)     # let it settle
+                    return True
+            else:
+                stable = 0
+                last_change = time.time()
+            prev = sig
+
+        print(f"    WARNING: tune did not settle within {timeout_s:.0f} s "
+              "(tune_timeout_s). The spectrum may be incomplete — raise "
+              "tune_timeout_s, or shorten the tune (fewer points / shorter dwell).")
+        return False
+
+    def do_tune(self, wait_time=5, wait_for_complete=True, verbose=False):
+        """Start a tune and (by default) wait until it has actually finished.
+
+        `wait_for_complete=False` restores the original fixed-sleep behaviour.
+        """
         self.igor.Execute('CanttuneFunc("DoTuneOnceButton")')
+        if wait_for_complete:
+            return self.wait_for_tune(verbose=verbose)
         time.sleep(wait_time)
+        return None
 
     def get_tune_data(self):
         """Read Frequency / Phase / Amp out of Igor over COM.
@@ -375,6 +656,11 @@ class AFMLaserSweepAutomation:
             Q = np.nan
         return f_res, Q
 
+    #: poll for tune completion instead of sleeping a fixed time. Leave True;
+    #: False only reproduces the old (unsafe for a condition series) behaviour.
+    wait_for_tune_complete = True
+    verbose_tune = False
+
     def tune_eigenmode(self, position_label="", scan_index=0, save_tune_data=True):
         """Tune, save, and return the FULL complex spectrum.
 
@@ -382,7 +668,9 @@ class AFMLaserSweepAutomation:
         Igor writes is guaranteed complete whereas the COM read has to be told
         how many points to fetch.
         """
-        self.do_tune(wait_time=self.tune_settling_time + 2)
+        completed = self.do_tune(wait_time=self.tune_settling_time + 2,
+                                 wait_for_complete=self.wait_for_tune_complete,
+                                 verbose=self.verbose_tune)
 
         td, tune_file = None, None
         if save_tune_data:
@@ -398,7 +686,8 @@ class AFMLaserSweepAutomation:
 
         f_res, Q = self.extract_resonance_from_tune(td)
         out = {'resonance_freq': f_res, 'q_factor': Q, 'tune_data': td,
-               'n_points': int(np.size(td['frequency'])) if td else 0}
+               'n_points': int(np.size(td['frequency'])) if td else 0,
+               'tune_completed': completed}
         if tune_file:
             out['tune_file'] = tune_file
         return out
@@ -524,6 +813,9 @@ class AsylumInstrument(Instrument):
             self.a.resonance_band_Hz = tuple(analysis_band_Hz)
         self._invols = None
         self._spring = None
+        #: which marked sample spot the scanner is at (None = wherever it was
+        #: left; set by goto_spot / measure_conditions_at)
+        self.current_spot = None
         self.records = []          # per-position metadata (mirrors the CSV log)
         self._scan_index = 0
         # apply DC bias once
@@ -654,6 +946,21 @@ class AsylumInstrument(Instrument):
         time.sleep(settle_s)
         return self.dc_bias_V
 
+    def goto_spot(self, spot_number, withdraw_first=True):
+        """Withdraw (by default) and move the SAMPLE to a marked spot.
+
+        Sample position selects e.g. the PPLN domain; it is independent of the
+        detection-laser position along the cantilever, which is untouched.
+        Does not re-engage — the next set_load(reengage=True) does that.
+        """
+        spot_number = int(spot_number)
+        if withdraw_first:
+            self.a.withdraw(); time.sleep(1.0)
+        ok = self.a.goto_spot(spot_number, wait=True,
+                              verbose=getattr(self.a, 'verbose_tune', False))
+        self.current_spot = spot_number
+        return ok
+
     def set_load(self, load_nN, reengage=True, settle_s=0.5):
         """Change the applied load via the deflection setpoint.
 
@@ -690,7 +997,8 @@ class AsylumInstrument(Instrument):
             except Exception as e:
                 print(f"  optical image failed: {e}")
         if self.recalibrate_each or self._invols is None:
-            a.do_autowedge()
+            if getattr(a, 'use_autowedge', True):
+                a.do_autowedge()
             self._invols = a.measure_invols()
             self._spring = a.get_gmv()['SpringConstant']
         return label
@@ -699,8 +1007,9 @@ class AsylumInstrument(Instrument):
         """Tune at the current position/condition and return (freq, Z, record)."""
         a = self.a
         bias = f"{'m' if self.dc_bias_V < 0 else 'p'}{abs(self.dc_bias_V):.3f}V".replace('.', 'p')
+        spot_tag = f"_S{self.current_spot}" if self.current_spot is not None else ""
         tune = a.tune_eigenmode(
-            position_label=f"{label}_DC{bias}_L{self.load_nN:04.0f}nN",
+            position_label=f"{label}_DC{bias}_L{self.load_nN:04.0f}nN{spot_tag}",
             scan_index=self._scan_index, save_tune_data=True)
         self._scan_index += 1
         td = tune['tune_data']
@@ -721,12 +1030,14 @@ class AsylumInstrument(Instrument):
                                      if self.span_um is not None else np.nan),
                    dc_bias_V=self.dc_bias_V,
                    load_nN=self.load_nN, setpoint_V=setpoint_V,
+                   sample_spot=self.current_spot,
                    invols_m_per_V=self._invols, spring_N_per_m=self._spring,
                    resonance_freq_Hz=tune['resonance_freq'],
                    q_factor=tune['q_factor'],
                    n_tune_points=int(freq_full.size),
                    tune_f_lo_Hz=float(freq_full[0]), tune_f_hi_Hz=float(freq_full[-1]),
                    n_fit_points=int(freq.size),
+                   tune_completed=bool(tune.get('tune_completed', True)),
                    tune_file=tune.get('tune_file'),
                    timestamp=time.strftime('%Y-%m-%d %H:%M:%S'))
         self.records.append(rec)
@@ -760,6 +1071,14 @@ class AsylumInstrument(Instrument):
         out, last_load = {}, None
         for i, cond in enumerate(conditions):
             try:
+                # sample-spot change first: it withdraws, so bias/load/engage
+                # must come after. A condition with spot=None never moves the
+                # sample, so plain bias/load series behave exactly as before.
+                spot = getattr(cond, 'spot', None)
+                spot_changed = (spot is not None and spot != self.current_spot)
+                if spot_changed:
+                    self.goto_spot(spot)
+                    last_load = None            # force a re-engage at the new spot
                 self.set_dc_bias(cond.bias_V)
                 need = (last_load is None
                         or abs(cond.load_nN - last_load) > 1e-9)
@@ -770,9 +1089,11 @@ class AsylumInstrument(Instrument):
                 freq, Z, rec = self._tune_and_read(label, setpoint_V)
                 out[i] = (freq, Z, rec)
                 if verbose:
+                    flag = "" if rec.get('tune_completed', True) else \
+                           "   ** TUNE DID NOT COMPLETE **"
                     print(f"      cond {i}: {cond.bias_V:+.2f} V, "
                           f"{cond.load_nN:.0f} nN -> {freq.size} pts, "
-                          f"f_res {rec['resonance_freq_Hz'] / 1e3:.2f} kHz")
+                          f"f_res {rec['resonance_freq_Hz'] / 1e3:.2f} kHz{flag}")
             except Exception as e:
                 out[i] = None
                 print(f"      cond {i} ({cond.bias_V:+.2f} V, {cond.load_nN:.0f} nN) "
