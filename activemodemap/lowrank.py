@@ -206,9 +206,11 @@ def dns_branch(x, Zrec, freq, ires, window_frac=0.35, merge_tol_um=None):
     lo = max(int(np.searchsorted(freq, fres - W)), 0)
     hi = min(int(np.searchsorted(freq, fres + W)), freq.size)
     fa = np.full(Zrec.shape[0], np.nan)
-    for i in range(Zrec.shape[0]):
-        j = int(np.argmin(np.abs(Zrec[i, lo:hi])))
-        if 0 < j < hi - lo - 1:
+    margin = 2                       # bins: a notch pinned at the window edge
+    for i in range(Zrec.shape[0]):   # is the search window clipping, not fa
+        row = np.abs(Zrec[i, lo:hi])
+        j = int(np.argmin(row))
+        if margin <= j < hi - lo - margin:
             fa[i] = freq[lo + j]
     g = fa - fres
     ok = np.isfinite(g)
@@ -232,6 +234,103 @@ def dns_branch(x, Zrec, freq, ires, window_frac=0.35, merge_tol_um=None):
         groups.append(cur)
         xc = np.array([np.mean(gp) for gp in groups])
     return xc, fa
+
+
+def classify_null(x, fa_Hz, f_res_Hz, tail_points=8, max_extrap_um=40.0,
+                  tail_frac=0.15, jump_guard=0.5):
+    """Boundary-aware classification of the antiresonance-branch null.
+
+    ``dns_branch`` returning no crossing used to read as *failure*. On probes
+    whose tip sits at (or effectively beyond) the free end — short tip-setback
+    batches — the branch fa(x) approaches the resonance toward the free end but
+    never crosses it inside the measured span. That is a *result*: the null is
+    at or beyond the free end, and the branch's own trend gives a bound on
+    where it would fall.
+
+    Parameters
+    ----------
+    x, fa_Hz : arrays from ``dns_branch`` (positions and the branch, NaN where
+        the notch left the window).
+    f_res_Hz : the resonance the branch is compared to.
+    tail_points : minimum number of finite branch points nearest the free end
+        used for the linear extrapolation. On fine reconstruction grids the
+        tail is widened to cover at least ``tail_frac`` of the span, so the
+        trend is not estimated from a few-µm sliver.
+    max_extrap_um : how far past the last measured point the extrapolated
+        crossing may fall and still count as "at/beyond end" rather than
+        "no approach".
+    jump_guard : a sign change only counts as a crossing if the branch is
+        actually NEAR the resonance there — min(|gap|) on the two sides must
+        be below ``jump_guard`` × median(|gap|). This rejects notch-identity
+        switches, where the deepest antiresonance hops from one side of the
+        resonance to the other (±tens of kHz) without ever passing through it.
+
+    Returns a dict:
+      status        'crossed' | 'at_or_beyond_end' | 'no_null'
+      x_null_um     crossing nearest the free end (status='crossed'), else NaN
+      x_bound_um    extrapolated crossing (status='at_or_beyond_end'), else NaN
+      gap_Hz        |fa - f_res| at the last finite branch point
+      crossings_um  every in-span crossing
+    """
+    x = np.asarray(x, float)
+    fa = np.asarray(fa_Hz, float)
+    g = fa - float(f_res_Hz)
+    ok = np.isfinite(g)
+    out = dict(status="no_null", x_null_um=float("nan"),
+               x_bound_um=float("nan"), gap_Hz=float("nan"),
+               crossings_um=[])
+    if ok.sum() < 2:
+        return out
+    # in-span crossings, as dns_branch finds them — but jump-guarded
+    med_gap = float(np.median(np.abs(g[ok])))
+    pair = ok[:-1] & ok[1:]
+    sgn = np.zeros(max(g.size - 1, 0), bool)
+    sgn[pair] = np.sign(g[:-1][pair]) != np.sign(g[1:][pair])
+    idx = [i for i in np.where(sgn)[0]
+           if min(abs(g[i]), abs(g[i + 1])) <= jump_guard * med_gap]
+    xc = [float(x[i] + (x[i + 1] - x[i]) * g[i] / (g[i] - g[i + 1]))
+          for i in idx]
+    out["crossings_um"] = xc
+    xi, gi = x[ok], g[ok]
+    out["gap_Hz"] = float(abs(gi[-1]))
+    if xc:
+        out["status"] = "crossed"
+        out["x_null_um"] = float(max(xc))  # convention: nearest the free end
+        return out
+    # no (accepted) in-span crossing: extrapolate the branch tail to the end.
+    # Use only the final same-sign segment, so a notch-identity switch inside
+    # the tail cannot corrupt the trend.
+    flips = np.where(np.sign(gi[:-1]) != np.sign(gi[1:]))[0]
+    if flips.size:
+        xi, gi = xi[flips[-1] + 1:], gi[flips[-1] + 1:]
+    if xi.size < 2:
+        return out
+    span = float(x[ok][-1] - x[ok][0])
+    in_tail = int(np.sum(xi >= xi[-1] - tail_frac * span))
+    n = min(max(int(tail_points), in_tail), xi.size)
+    xt, gt = xi[-n:], gi[-n:]
+    if np.ptp(xt) <= 0:
+        return out
+    slope, icpt = np.polyfit(xt, gt, 1)
+    closing = slope * np.sign(gt[-1]) < 0        # |gap| shrinking toward end
+    if not closing or slope == 0:
+        return out
+    x_root = -icpt / slope
+    if xi[-1] < x_root <= xi[-1] + float(max_extrap_um):
+        out["status"] = "at_or_beyond_end"
+        out["x_bound_um"] = float(x_root)
+    return out
+
+
+def classify_null_from_map(x, Zrec, freq, ires, window_frac=0.35,
+                           tail_points=8, max_extrap_um=40.0):
+    """``dns_branch`` + ``classify_null`` in one call. Returns the same dict,
+    plus ``fa_Hz`` (the branch itself) for plotting."""
+    xc, fa = dns_branch(x, Zrec, freq, int(ires), window_frac=window_frac)
+    res = classify_null(x, fa, freq[int(ires)], tail_points=tail_points,
+                        max_extrap_um=max_extrap_um)
+    res["fa_Hz"] = fa
+    return res
 
 
 def _dns_onres_crossing(x, Zrec, freq, ires, guess_um):
@@ -368,6 +467,7 @@ class LowRankModeMap:
         self.dns_band_Hz = None if dns_band_Hz is None else (
             float(min(dns_band_Hz)), float(max(dns_band_Hz)))
         self._measured = {}     # grid index -> complex spectrum on self.freq
+        self._blocked = set()   # grid indices that failed and must not be retried
         self._last = None
         self.history = []       # [{n, dns, dns_ci}] one entry per reconstruct()
 
@@ -427,16 +527,28 @@ class LowRankModeMap:
         return i
 
     # -- acquisition ------------------------------------------------------ #
+    def block_position(self, x_um):
+        """Mark a position as unusable so `next_position` stops offering it.
+
+        Without this, a position whose measurement fails is neither recorded nor
+        excluded, so the D-optimal order keeps returning it and the acquisition
+        loop spins on it forever.
+        """
+        i = int(np.argmin(np.abs(self.x_grid - float(x_um))))
+        self._blocked.add(i)
+        return float(self.x_grid[i])
+
     def next_position(self):
         """Next detection position (µm) from the D-optimal order not yet
         measured. Once the D-optimal set is exhausted, refine near the current
         D-NS estimate."""
         for i in self._order:
-            if i not in self._measured:
+            if i not in self._measured and i not in self._blocked:
                 return float(self.x_grid[i])
         # exhausted -> refine around the current null estimate
         if self._last is not None and np.isfinite(self._last["dns"]):
-            cand = [i for i in range(self.x_grid.size) if i not in self._measured]
+            cand = [i for i in range(self.x_grid.size)
+                    if i not in self._measured and i not in self._blocked]
             if cand:
                 j = min(cand, key=lambda i: abs(self.x_grid[i] - self._last["dns"]))
                 return float(self.x_grid[j])
