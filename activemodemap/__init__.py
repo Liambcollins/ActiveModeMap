@@ -20,21 +20,27 @@ from .inference import PhysicsPosterior
 from .loop import run_loop
 from .lowrank import (LowRankModeMap, reconstruct_map, d_optimal_order,
                       chebyshev_basis, dns_from_map, resonance_index,
-                      dns_branch, band_mask, spatial_null)
+                      dns_branch, band_mask, spatial_null,
+                      classify_null, classify_null_from_map)
 from .series import (Condition, make_conditions, run_series, reconstruct_series,
-                     separate_channels, estimate_v_cpd, channel_spots,
+                     separate_channels, estimate_v_cpd, channel_spots, separate_domains,
                      save_checkpoint, load_checkpoint)
 from .online import (Instrument, VirtualInstrument, plot_state,
-                     LiveModeMapPlot, dense_reference_sweep, compare_to_dense, dense_grid)
+                     LiveModeMapPlot, dense_reference_sweep, compare_to_dense, dense_grid,
+                     PositionScale, fit_position_scale, fit_position_scale_optical,
+                     peak_in_band)
 
 __all__ = [
     "EBForwardModel", "ProbeGeometry", "VirtualAFM", "PhysicsPosterior",
     "run_loop", "LowRankModeMap", "reconstruct_map", "d_optimal_order",
     "chebyshev_basis", "dns_from_map", "resonance_index",
     "dns_branch", "band_mask", "spatial_null",
+    "classify_null", "classify_null_from_map",
     "Instrument", "VirtualInstrument", "plot_state",
     "LiveModeMapPlot", "dense_reference_sweep", "compare_to_dense", "dense_grid",
+    "PositionScale", "fit_position_scale", "fit_position_scale_optical",
+    "peak_in_band",
     "Condition", "make_conditions", "run_series", "reconstruct_series",
-    "separate_channels", "estimate_v_cpd", "channel_spots",
+    "separate_channels", "estimate_v_cpd", "channel_spots", "separate_domains",
     "save_checkpoint", "load_checkpoint",
 ]
