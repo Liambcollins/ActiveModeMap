@@ -68,20 +68,29 @@ from .lowrank import (LowRankModeMap, reconstruct_map, dns_from_map,
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Condition:
-    """One (DC bias, load) operating point."""
+    """One operating point: DC bias, load, and optionally a marked sample spot.
+
+    `spot` selects a position ON THE SAMPLE (a spot marked on an image via the
+    Force panel, e.g. one PPLN domain) — orthogonal to the laser position along
+    the cantilever, which the acquisition loop owns. None = leave the sample
+    where it is, so plain bias/load series are unchanged.
+    """
     bias_V: float
     load_nN: float
+    spot: int | None = None
 
     @property
     def label(self):
         s = "m" if self.bias_V < 0 else "p"
-        return f"DC{s}{abs(self.bias_V):.3f}V_L{self.load_nN:04.0f}nN".replace(".", "p")
+        base = f"DC{s}{abs(self.bias_V):.3f}V_L{self.load_nN:04.0f}nN".replace(".", "p")
+        return base + (f"_S{self.spot}" if self.spot is not None else "")
 
     def __str__(self):
-        return f"{self.bias_V:+.3f} V, {self.load_nN:.0f} nN"
+        base = f"{self.bias_V:+.3f} V, {self.load_nN:.0f} nN"
+        return base + (f", spot {self.spot}" if self.spot is not None else "")
 
 
-def make_conditions(bias_V, load_nN, vary="bias_inner"):
+def make_conditions(bias_V, load_nN, vary="bias_inner", spots=None):
     """Build a condition list from bias and load values.
 
     `bias_V` and `load_nN` may be scalars or sequences. `vary='bias_inner'`
@@ -92,20 +101,26 @@ def make_conditions(bias_V, load_nN, vary="bias_inner"):
     A bias sweep at a single load gives the channel separation; a load sweep at a
     single bias gives the D-NS migration; both gives you each load's channel
     separation.
+
+    `spots` (e.g. [1, 2] for two PPLN domains) is always the OUTERMOST loop:
+    a sample-spot change costs a withdraw + scanner ramp + re-engage (~20-30 s),
+    so all conditions at one spot are finished before hopping to the next.
     """
     b = np.atleast_1d(np.asarray(bias_V, float))
     l = np.atleast_1d(np.asarray(load_nN, float))
+    sp = [None] if spots is None else [int(x) for x in np.atleast_1d(spots)]
     out = []
-    if vary == "bias_inner":
-        for ll in l:
-            for bb in b:
-                out.append(Condition(float(bb), float(ll)))
-    elif vary == "load_inner":
-        for bb in b:
+    for spot in sp:
+        if vary == "bias_inner":
             for ll in l:
-                out.append(Condition(float(bb), float(ll)))
-    else:
-        raise ValueError("vary must be 'bias_inner' or 'load_inner'")
+                for bb in b:
+                    out.append(Condition(float(bb), float(ll), spot))
+        elif vary == "load_inner":
+            for bb in b:
+                for ll in l:
+                    out.append(Condition(float(bb), float(ll), spot))
+        else:
+            raise ValueError("vary must be 'bias_inner' or 'load_inner'")
     return out
 
 
@@ -165,6 +180,7 @@ def run_series(instrument, x_grid_um, conditions, ref_index=None, rank=4,
                   "already measured")
 
     t0 = time.time()
+    consecutive_failures = 0
     while mm.n < max_positions:
         x = mm.next_position()
         if float(x) in measured:                     # already have it (resume)
@@ -183,9 +199,21 @@ def run_series(instrument, x_grid_um, conditions, ref_index=None, rank=4,
             break
 
         if got.get(ref_index) is None:
-            print(f"  reference condition failed at x={x:.1f}; skipping this "
-                  "position (it cannot drive the loop)")
+            # Block it, or next_position() returns the same x forever and the loop
+            # spins. Several in a row means the fault is systemic (a bad tune
+            # setup, a code error in the instrument path) rather than one awkward
+            # spot, so stop and let the traceback above be read.
+            mm.block_position(x)
+            consecutive_failures += 1
+            print(f"  reference condition failed at x={x:.1f}; blocking this "
+                  f"position ({consecutive_failures} consecutive failure(s))")
+            if consecutive_failures >= 3:
+                print("  THREE POSITIONS IN A ROW FAILED - stopping. This is not "
+                      "bad luck with the surface; fix the error reported above "
+                      "and re-run. Nothing measured so far is lost.")
+                break
             continue
+        consecutive_failures = 0
         measured[float(x)] = {i: (v[0], v[1]) for i, v in got.items()
                               if v is not None}
         f_ref, Z_ref = got[ref_index][0], got[ref_index][1]
@@ -370,6 +398,72 @@ def separate_channels(series, load_nN=None, v_cpd=0.0, min_biases=3):
                 rel_resid=float(np.nanmax(resid) / (np.nanmax(np.abs(Z)) + 1e-30)))
 
 
+def separate_domains(series, spot_up, spot_down, bias_V=None, load_nN=None):
+    """Split piezo and electrostatic channels from TWO PPLN domains.
+
+    The piezoresponse flips sign with the domain while the electrostatic
+    response does not:
+
+        Z_up   = +P + E
+        Z_down = -P + E        =>   P = (Z_up - Z_down) / 2
+                                    E = (Z_up + Z_down) / 2
+
+    Exact per (x, f) — no fit, no residual, and no assumption about V_cpd. Note
+    E here is the electrostatic response AT THE MEASUREMENT BIAS (it scales with
+    V - V_cpd), which is fine for locating the blind spot: the spatial null of E
+    does not move with its overall scale. If the measurement bias happens to sit
+    near V_cpd, E is small everywhere and its null is poorly conditioned — use a
+    deliberately nonzero bias, or a bias where the response is strong.
+
+    `spot_up` / `spot_down` name the marked spots; which physical orientation is
+    "up" only fixes the overall sign of P, which no null-spot estimate depends
+    on. Returns the same dict shape as `separate_channels`, so `channel_spots`
+    applies unchanged (`rel_resid` is NaN: a two-point decomposition is exact and
+    has no linearity check — the consistency test is instead `imbalance`, see
+    below).
+    """
+    conds = series["conditions"]
+
+    def pick(spot):
+        idx = [i for i, c in enumerate(conds)
+               if getattr(c, "spot", None) == spot
+               and (bias_V is None or abs(c.bias_V - bias_V) < 1e-9)
+               and (load_nN is None or abs(c.load_nN - load_nN) < 1e-9)]
+        if len(idx) != 1:
+            raise ValueError(
+                f"expected exactly one condition at spot {spot} "
+                f"(bias_V={bias_V}, load_nN={load_nN}); found {len(idx)}. "
+                "Pass bias_V/load_nN to disambiguate.")
+        return idx[0]
+
+    iu, idn = pick(spot_up), pick(spot_down)
+    Zu, Zd = series["Z"][iu], series["Z"][idn]
+    if not (np.isfinite(Zu).all() and np.isfinite(Zd).all()):
+        raise ValueError("one of the domain spectra is incomplete")
+    P = (Zu - Zd) / 2.0
+    E = (Zu + Zd) / 2.0
+    # NOTE there is no model-free consistency check from a single bias: the
+    # decomposition uses both measurements exactly (2 unknowns, 2 data), and
+    # |Z_up| != |Z_down| even for perfect domains because the electrostatic term
+    # interferes constructively in one and destructively in the other. In
+    # particular, a contact-gain difference g between the two spots is
+    # INDISTINGUISHABLE from electrostatics here: it leaks (g1-g2)/2 * P into
+    # the E channel. The guard against that is a second bias -- E must scale
+    # with (V - V_cpd) while leaked P must not; measure at two biases and
+    # compare the two P estimates (they should agree) and the two E estimates
+    # (they should scale). `elec_frac` below is informational only: how much of
+    # the strong-signal response is electrostatic at this bias.
+    tot = np.abs(P) + np.abs(E)
+    strong = tot > 0.25 * tot.max()
+    elec_frac = float(np.median(np.abs(E[strong]) / (tot[strong] + 1e-30)))
+    return dict(piezo=P, elec=E, intercept=P, resid=np.full(P.shape, np.nan),
+                bias_V=np.array([conds[iu].bias_V]),
+                load_nN=conds[iu].load_nN, v_cpd=np.nan,
+                x_um=series["x_um"], freq_Hz=series["freq_Hz"],
+                rel_resid=float("nan"), elec_frac=elec_frac,
+                spot_up=spot_up, spot_down=spot_down)
+
+
 def estimate_v_cpd(channels, band_Hz=None):
     """Bias that minimises the total response, per position — a V_cpd proxy.
 
@@ -435,7 +529,14 @@ def channel_spots(channels, x_grid_um, rank=4, band_Hz=None, verbose=True):
         print(f"  D-ESBS (electrostatic, spatial null) : "
               f"{out['desbs']['value_um']:.2f} um  "
               f"[at {out['desbs']['f_res_Hz'] / 1e3:.1f} kHz, not quasistatic]")
-        print(f"  linearity: peak residual {100 * channels['rel_resid']:.1f}% of "
-              "peak |Z| (large => response not linear in bias: domain switching, "
-              "or the contact drifted during the sweep)")
+        rr = channels.get("rel_resid", float("nan"))
+        if np.isfinite(rr):
+            print(f"  linearity: peak residual {100 * rr:.1f}% of peak |Z| "
+                  "(large => response not linear in bias: domain switching, or "
+                  "the contact drifted during the sweep)")
+        if np.isfinite(channels.get("elec_frac", float("nan"))):
+            print(f"  electrostatic fraction of the strong signal: "
+                  f"{100 * channels['elec_frac']:.1f}% at this bias "
+                  "(informational; a contact-gain difference between the spots "
+                  "leaks piezo into this channel — verify with a second bias)")
     return out
