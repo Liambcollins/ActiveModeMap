@@ -1,0 +1,8 @@
+numpy
+scipy
+pandas
+h5py
+matplotlib
+# external, installed separately (not on PyPI):
+#   eb_cr_afm  -- pip install -e <EB-Solver-CResonance repo>  (or config.add_eb_to_path())
+#   activemodemap -- pip install -e <ActiveModeMap repo root>
