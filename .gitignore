@@ -15,3 +15,8 @@ commit_tune_wait_fix.ps1
 # local working backups
 _backup_*/
 _to_delete/
+
+*.BACKUP*
+.virtual_documents/
+Claude outputs/
+Untitled*.ipynb

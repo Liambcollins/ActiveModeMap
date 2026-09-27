@@ -1,0 +1,251 @@
+diff --git a/studies/eb_gp_reconstruction/README.md b/studies/eb_gp_reconstruction/README.md
+index c5b4ec6..dc2c5dd 100644
+--- a/studies/eb_gp_reconstruction/README.md
++++ b/studies/eb_gp_reconstruction/README.md
+@@ -26,10 +26,22 @@ still runnable, with `archive/README.md` explaining why each was demoted.
+   EB+GP and FEM+GP both land 0.15 µm away. **GP alone never finds a crossing
+   in span, at any budget** — this is the one place the physics is not a
+   refinement but the difference between finding the feature and not.
+-- **Phase fails structurally, in both forward models.** EB 42.4° mean absolute
+-  phase error, FEM 41.4°; complex NRMSE 142 % / 144 %. At contact stiffnesses
+-  a factor 3 apart, the two models fail *identically*, so the missing physics
+-  is in the drive or detection model, not the geometry.
++- **Phase (corrected 2026-09-17).** The published "structural phase failure"
++  (EB 42.4° mean absolute phase error, FEM 41.4°; complex NRMSE 142 % / 144 %,
++  identical in both models) was a **phase-convention defect at the data
++  boundary**, not missing physics: `DenseReference.npz` stores the Cypher's
++  `amp·exp(+iφ)` (phase increasing through resonance) while every EB/FEM
++  library has the phase decreasing, so the arms were fitting the complex
++  conjugate of the data — model-independent, which is exactly why two models a
++  factor 3 apart in k₁ failed identically. `setup_data.load` now conjugates
++  untagged spectra (`to_model_convention`) and `cplxrec._gain` is the complex
++  least-squares gain again. With the package fitter on the corrected data
++  (`src/pkgrec.py`, band A, n = 8, held-out positions): bare EB **13.0 %
++  complex NRMSE, 4.5° phase MAE**; EB+GP **4.4 % / 1.3°**; the raw-convention
++  ablation reproduces the failure (99.9 %, 54°). The published library arms
++  need `eblib_cplx.npz` rebuilt (`MEAS_CX` moved to the node-fit 221.9 µm,
++  axis shifted rather than restretched) and `run_recon_cplx.py` re-run; the
++  numbers above are the expectation for that re-run.
+ - **k₁ is not identifiable from band A alone.** The mode ratio is what pins it:
+   measured f₂/f₁ = 3.0794, which EB reaches at **k₁ ≈ 1044 N/m**. Two-band
+   fitting with a per-band gain returns **k₁ = 989 ± 15 N/m across n = 3–30**,
+diff --git a/studies/eb_gp_reconstruction/libraries/buildlib_cplx.py b/studies/eb_gp_reconstruction/libraries/buildlib_cplx.py
+index 1d7b212..9c99f8b 100644
+--- a/studies/eb_gp_reconstruction/libraries/buildlib_cplx.py
++++ b/studies/eb_gp_reconstruction/libraries/buildlib_cplx.py
+@@ -54,9 +54,18 @@ BASE = {k: G[k] for k in ['name', 'L', 'contact_x', 'tip_offset', 'H',
+ P = ProbeGeometry(**BASE)
+ F_REF = P.f_free(1)
+ CX = P.contact_x * 1e6                        # 225.0 um on the model beam
+-MEAS_CX = 214.1
++# Tip contact on the InvOLS-calibrated measured axis.  214.1 was a fit done on
++# the COMMANDED axis (tip-position-fit-2026-08-14: "on the raw commanded axis
++# the fit returns 211-215").  The on-resonance mode-1 and mode-2 nodes of
++# Dense_Grid_B agree on 221.9 +/- 1.2 um on the ruler axis (k1 = 993 N/m,
++# k2 = 0); the package fit on Grid_A lands at 222.0 with the contact free.
++MEAS_CX = 221.9
+ x_meas = np.load(str(OUT) + '/x_cal.npy')
+-x_model = (x_meas / MEAS_CX) * CX * 1e-6      # metres
++# The calibrated axis is already metric: map it onto the model beam by a SHIFT
++# that puts the measured contact on the model's contact_x, not by restretching
++# the whole axis (the old x_meas/MEAS_CX*CX applied a second 5 % scale on top
++# of the InvOLS calibration).
++x_model = (x_meas + (CX - MEAS_CX)) * 1e-6    # metres
+ NP = len(x_model)
+ print(f'f_free1 {F_REF:.1f} Hz, k_lever {P.k_static:.3f} N/m, '
+       f'{len(K1)}x{len(GG)} rungs x {len(FLIB)} frequencies')
+diff --git a/studies/eb_gp_reconstruction/src/cplxrec.py b/studies/eb_gp_reconstruction/src/cplxrec.py
+index 4dea4aa..d4c10ec 100644
+--- a/studies/eb_gp_reconstruction/src/cplxrec.py
++++ b/studies/eb_gp_reconstruction/src/cplxrec.py
+@@ -117,30 +117,24 @@ def _gp_posterior(x_grid, xs, R, ell, noise_frac=0.05):
+ 
+ # ---------------------------------------------------------------- arms
+ def _gain(Ms, Zs, F):
+-    """One complex gain: detection scale x arbitrary reference phase.
+-
+-    NOT the complex least-squares gain <M,Z>/<M,M>.  The measured phase runs
+-    ~180 deg across the resonance, and any residual phase error between model
+-    and data makes that coherent sum cancel -- the LS gain came out ~10x too
+-    small and put the arm at 100 % error, with the amplitude wrong for a reason
+-    that had nothing to do with amplitude.  Instead the two halves are
+-    estimated separately, each with the estimator that is robust for it:
+-
+-      |gain|   the published log-amplitude gain, a mean of log ratios over the
+-               high-SNR revealed bins -- the same number rec_eb uses, so the
+-               amplitude of this arm matches the published FEM arm
+-      arg gain the amplitude-weighted CIRCULAR mean of arg(Z/M), which is the
+-               right average for an angle and is not destroyed by the 180 deg
+-               swing through resonance
++    """One complex gain: detection scale x reference phase.
++
++    The complex least-squares gain <M,Z>/<M,M> over the high-SNR revealed bins.
++    Until 2026-09-17 this function deliberately AVOIDED that estimator: it
++    "came out ~10x too small and put the arm at 100 % error".  That was the
++    signature of fitting the complex conjugate of the data (setup_data now
++    puts Z in the model's phase convention), not a weakness of the estimator:
++    against conjugated data the coherent sum cancels through the resonance,
++    and no magnitude/circular-phase split can repair it (the residual is
++    2*(phi - phi_ref), ~45 deg mean).  With the convention fixed the LS gain is
++    the maximum-likelihood one for additive complex noise.
+     """
+     w = np.abs(Zs) > 3.0 * F
+     if w.sum() < 8:
+         w = np.ones_like(np.abs(Zs), bool)
+-    lr = np.log(np.abs(Zs)[w]) - np.log(np.maximum(np.abs(Ms)[w], 1e-300))
+-    mag = float(np.exp(np.mean(lr)))
+-    r = (Zs / Ms)[w]
+-    ang = float(np.angle(np.sum(np.abs(Zs)[w] * r / np.abs(r))))
+-    return mag * np.exp(1j * ang)
++    m, z = Ms[w], Zs[w]
++    den = np.vdot(m, m).real
++    return complex(np.vdot(m, z) / den) if den > 0 else 1.0 + 0j
+ 
+ 
+ def rec_gp_cplx(x_grid, sel_idx, Z_sel, freq,
+diff --git a/studies/eb_gp_reconstruction/src/pkgrec.py b/studies/eb_gp_reconstruction/src/pkgrec.py
+new file mode 100644
+index 0000000..882235b
+--- /dev/null
++++ b/studies/eb_gp_reconstruction/src/pkgrec.py
+@@ -0,0 +1,90 @@
++"""Package-backed physics arm: the study's EB / EB+GP reconstruction through
++`activemodemap.inference.PhysicsPosterior`, so there is ONE physics fitter in
++the repository instead of the study's library-grid fit plus the package's.
++
++Leakage-safe like every arm in cplxrec: sees only (x_grid, sel_idx, Z_sel,
++freq).  Returns the same dict shape as `cplxrec.rec_phys_cplx` so
++`run_recon_cplx.py` / `sweep_n_cplx.py` can call it as a drop-in arm.
++
++Requires Z in the MODEL phase convention (setup_data.load does that) and the
++2026-09-17 package: fit_zeta / fit_geometry / analytic_gain on PhysicsPosterior.
++
++    from pkgrec import rec_eb_pkg
++    out = rec_eb_pkg(x, sel, Z[sel], f, gp=True)          # Zrec (npos, nfreq)
++
++Geometry defaults are the SCM-PIT/Multi75G lever of Dense_Grid_A/B on the
++InvOLS-calibrated axis: L = 232 um (the operator's 225 anchor is 3-9 um short
++of the free end), contact 221.9 um from the node fit (fitted inside 218-224
++unless `pin_contact=True`), k_lever 2.387 N/m, f0 free in 50-100 kHz.
++"""
++import sys as _sys, os as _os
++_D = _os.path.dirname(_os.path.abspath(__file__))
++while not _os.path.exists(_os.path.join(_D, 'config.py')):
++    _D = _os.path.dirname(_D)
++_sys.path[:0] = [_D, _os.path.join(_D, 'src')]
++
++import numpy as np
++from activemodemap.forward_model import EBForwardModel, ProbeGeometry
++from activemodemap.inference import PhysicsPosterior
++from activemodemap.hybrid import HybridSurrogate
++
++L_UM = 232.0
++K_LEVER = 2.387
++NODE_CONTACT_UM = 221.9
++CONTACT_BAND_UM = (218.0, 224.0)
++F0_BOUNDS_HZ = (50e3, 100e3)
++
++
++def build_model(freq, f0_hz=60e3, contact_um=NODE_CONTACT_UM, L_um=L_UM,
++                k_lever=K_LEVER, n_modes=12, nx=481):
++    geom = ProbeGeometry(name='SCM-PIT', f0_hz=f0_hz, k_lever=k_lever, L_um=L_um,
++                         tip_setback_um=L_um - contact_um, tip_height_um=12.5,
++                         tilt_deg=11.0, tip_mass_ratio=0.004)
++    fs = f0_hz / 1.87510407 ** 2
++    m = EBForwardModel(geom=geom, n_modes=n_modes, nx=nx, nf=len(freq),
++                       omega_lo=float(freq[0] / fs), omega_hi=float(freq[-1] / fs))
++    m.PRIOR_LO = np.array([1.0, 1.0, 0.5, -4.0, -4.0])
++    m.PRIOR_HI = np.array([5.0, 4.0, 2.5, 1.0, 1.0])
++    return m
++
++
++def _sigma(Z, half=6):
++    from scipy.ndimage import uniform_filter1d
++    sm = uniform_filter1d(Z.real, 2 * half + 1, axis=1) + 1j * uniform_filter1d(Z.imag, 2 * half + 1, axis=1)
++    a = np.abs(Z - sm).ravel()
++    return float(np.median(a) + 1.4826 * np.median(np.abs(a - np.median(a))))
++
++
++def rec_eb_pkg(x_grid, sel_idx, Z_sel, freq, gp=True, pin_contact=False,
++               L_um=L_UM, seed=0, **kw):
++    sel = np.asarray(sel_idx)
++    x_grid = np.asarray(x_grid, float)
++    scale = float(np.abs(Z_sel).max())
++    Zs = np.asarray(Z_sel) / scale
++    model = build_model(freq, L_um=L_um)
++    xi = x_grid / L_um
++    data = [{'x': xi[i], 'plus': Zs[k]} for k, i in enumerate(sel)]
++    if pin_contact:
++        post = PhysicsPosterior(model, sigma=_sigma(Zs), rng=np.random.default_rng(seed),
++                                fit_zeta=True, fit_geometry='f0', analytic_gain=True,
++                                f0_bounds_hz=F0_BOUNDS_HZ)
++    else:
++        post = PhysicsPosterior(model, sigma=_sigma(Zs), rng=np.random.default_rng(seed),
++                                fit_zeta=True, fit_geometry=True, analytic_gain=True,
++                                f0_bounds_hz=F0_BOUNDS_HZ,
++                                setback_bounds_um=(L_um - CONTACT_BAND_UM[1], L_um - CONTACT_BAND_UM[0]))
++    th = post.fit(data)
++    cols = [int(np.argmin(np.abs(post.model.xi - v))) for v in xi]
++    eb = post.predict_map()[:, cols].T
++    if gp:
++        sur = HybridSurrogate(post).update(data)
++        Zrec = sur.corrected_maps()[0][:, cols].T
++    else:
++        Zrec = eb
++    theta = dict(zip(post.names, map(float, th)))
++    theta['contact_um'] = L_um - theta.get('tip_setback_um', L_um - NODE_CONTACT_UM)
++    theta['zeta'] = 10 ** theta['log_zeta']
++    theta['red_chi2'] = float(post.red_chi2)
++    sd = np.full(Zrec.shape, np.nan)
++    return dict(Zrec=Zrec * scale, Zeb=eb * scale, sd=sd, sd_gp=sd, sd_par=sd,
++                ell=None, theta=theta, gain=complex(post.gain) * scale)
+diff --git a/studies/eb_gp_reconstruction/src/setup_data.py b/studies/eb_gp_reconstruction/src/setup_data.py
+index b80c97a..aa9cd5f 100644
+--- a/studies/eb_gp_reconstruction/src/setup_data.py
++++ b/studies/eb_gp_reconstruction/src/setup_data.py
+@@ -14,9 +14,45 @@ from activemodemap.lowrank import band_mask, resonance_index, classify_null_from
+ from config import DENSE_GRID_A
+ D=str(DENSE_GRID_A)
+ BANDS=dict(A=(270e3,450e3), B=(860e3,1300e3))
++#: Phase convention of the stored spectra.  DenseReference.npz was written by
++#: series.save_checkpoint before 2026-09-17 with Z = amp*exp(+i*phase_igor);
++#: the Cypher phase INCREASES through resonance (+132 deg on Grid_A), while
++#: every EB/FEM library here has the phase DECREASING (-159 deg).  Fitting the
++#: raw Z therefore compares the model to the complex CONJUGATE of the data --
++#: the 42.4 deg / 142 % "structural phase failure" in the README, and the
++#: reason cplxrec._gain had to avoid the complex least-squares gain.  Files
++#: carrying a 'phase_convention' tag are honoured; untagged files are treated
++#: as igor-raw and conjugated.  See activemodemap.asylum.PHASE_SIGN.
++MODEL_PHASE_CONVENTION = 'model'
++
++
++def phase_slope_through_peak(freq, amp, phase_deg, width_factor=2.0):
++    """Unwrapped phase change (deg) across the strongest peak; >0 = increasing."""
++    from activemodemap.asylum import phase_slope_through_peak as _p
++    return _p(freq, amp, phase_deg, width_factor=width_factor)
++
++
++def to_model_convention(Z, tag=None, freq=None, verbose=True):
++    """Return Z in the forward models' phase convention (phase decreasing
++    through resonance).  `tag` is the checkpoint's 'phase_convention' entry
++    when present; None means igor-raw."""
++    tag = 'igor-raw' if tag is None else str(tag)
++    if tag == MODEL_PHASE_CONVENTION:
++        return Z
++    if freq is not None and verbose:
++        i = int(np.argmax(np.abs(Z).max(axis=1)))
++        s = phase_slope_through_peak(freq, np.abs(Z[i]), np.degrees(np.angle(Z[i])))
++        if np.isfinite(s) and s < 0:
++            print(f'  ** setup_data: stored spectra already have the model convention '
++                  f'({s:+.0f} deg through the peak) but carry tag {tag!r}; NOT conjugating')
++            return Z
++    return np.conj(Z)
++
++
+ def load(mode='A', axis='calibrated'):
+     dn=np.load(D+'/DenseReference.npz',allow_pickle=True)
+     x=dn['x_um'].astype(float); f=dn['freq_Hz']; Z=dn['Z']
++    Z=to_model_convention(Z, dn['phase_convention'] if 'phase_convention' in dn.files else None, f)
+     bm=band_mask(f,BANDS[mode]); f=f[bm]; Z=Z[:,bm]
+     if axis=='calibrated':
+         dl=pd.read_csv(D+'/DenseReference_log.csv',parse_dates=['timestamp'])

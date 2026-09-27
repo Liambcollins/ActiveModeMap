@@ -122,29 +122,37 @@ class HybridSurrogate:
 
     def __init__(self, post: PhysicsPosterior):
         self.post = post
-        self.model = post.model
         self.gp = None
 
+    @property
+    def model(self):
+        # follow the posterior: after a geometry fit, post.model is the rebuilt one
+        return self.post.model
+
     def update(self, data):
+        """Fit the discrepancy GP to the complex residuals at the measured
+        positions. Works for a domain pair (rows = [plus | minus]) or a single
+        measured domain (rows = [plus] only); the correction for an unmeasured
+        domain is zero."""
         m, post = self.model, self.post
-        resp = m.response(post.theta_map)
-        zp, ze = post._blur(resp["piezo"]), post._blur(resp["elec"])
-        pred = {"plus": resp["A0"] * (zp + resp["eps"] * ze),
-                "minus": resp["A0"] * (-zp + resp["eps"] * ze)}
+        # keys present in the data, in canonical order
+        self._keys = [k for k in ("plus", "minus") if any(k in d for d in data)]
+        pred = {"plus": post.predict_map(domain_sign=+1.0),
+                "minus": post.predict_map(domain_sign=-1.0)}
         xs, rows = [], []
         for d in data:
             i = int(np.argmin(np.abs(m.xi - d["x"])))
             xs.append(m.xi[i])
-            rows.append(np.concatenate([(d["plus"] - pred["plus"][:, i]),
-                                        (d["minus"] - pred["minus"][:, i])])
-                        / post.sigma)
+            rows.append(np.concatenate([(d[k] - pred[k][:, i]) for k in self._keys
+                                        if k in d]) / post.sigma)
         self.gp = DiscrepancyGP(m).fit(np.array(xs), np.array(rows))
         self._pred = pred
         return self
 
     def corrected_maps(self, xq=None, sample_rng=None):
         """EB(theta_MAP) + GP mean correction on the full grid; optionally one
-        GP posterior sample instead of the mean (for uncertainty)."""
+        GP posterior sample instead of the mean (for uncertainty).
+        Returns (plus, minus); an unmeasured domain carries no correction."""
         m = self.model
         xq = m.xi if xq is None else xq
         mean, var = self.gp.predict(xq)
@@ -153,9 +161,12 @@ class HybridSurrogate:
                 sample_rng.standard_normal(mean.shape)
                 + 1j * sample_rng.standard_normal(mean.shape)) / np.sqrt(2)
         nf = m.omega.size
-        corr = mean.T * self.post.sigma          # (2nf, nx)
-        plus = self._pred["plus"] + corr[:nf]
-        minus = self._pred["minus"] + corr[nf:]
+        corr = mean.T * self.post.sigma          # (n_keys*nf, nx)
+        out = {}
+        for j, k in enumerate(self._keys):
+            out[k] = self._pred[k] + corr[j * nf:(j + 1) * nf]
+        plus = out.get("plus", self._pred["plus"])
+        minus = out.get("minus", self._pred["minus"])
         return plus, minus
 
     def spot_posterior(self, n_samples=40, rng=None):

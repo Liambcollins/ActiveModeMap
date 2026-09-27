@@ -89,10 +89,82 @@ def read_tune_txt(path):
             "amplitude": pick("amp", 2)}
 
 
-def tune_to_complex(tune_data, band_Hz=None, drop_nonfinite=True):
+#: Sign applied to the Igor phase when building the complex spectrum.
+#:
+#: The Cypher tune reports a phase that INCREASES through a resonance (+147 deg
+#: on the Multi75E-G/PPLN bundled data, +158 deg on a PPP-CONTAu; 30/30 and
+#: 75/75 positions). The EB forward model, which solves (K + i w C - w^2 M) q = F,
+#: has the phase DECREASING through resonance (-159 deg). Building
+#: Z = amp * exp(+i * phase) therefore hands every physics fit the complex
+#: CONJUGATE of what the model produces: the complex residual cannot be driven
+#: down by any parameter, the fit shrinks the gain instead, and the
+#: log-amplitude workaround in scripts/eb_fit_real.py was the only thing that
+#: worked. -1 puts the data in the model's convention. The low-rank
+#: reconstruction and the null estimators are unaffected either way (a
+#: conjugation is linear and preserves zero crossings).
+PHASE_SIGN = -1.0
+PHASE_CONVENTION = "model"      # tag written into checkpoints built from this data
+
+
+def phase_slope_through_peak(freq_Hz, amp, phase_deg, width_factor=2.0):
+    """Unwrapped phase change (deg) across the strongest peak: positive when
+    the phase increases with frequency through the resonance.
+
+    The window adapts to the line: the half-power points are found on each side
+    of the peak and the window is `width_factor` times that half-width, so a
+    32000-point and a 1000-point tune of the same resonance give the same answer.
+    Returns NaN if the peak is not resolved."""
+    f = np.asarray(freq_Hz, float); a = np.asarray(amp, float)
+    ph = np.asarray(phase_deg, float)
+    good = np.isfinite(f) & np.isfinite(a) & np.isfinite(ph)
+    f, a, ph = f[good], a[good], ph[good]
+    if a.size < 8:
+        return np.nan
+    i = int(np.argmax(a)); h = a[i] / np.sqrt(2.0)
+    lo = i
+    while lo > 0 and a[lo] > h:
+        lo -= 1
+    hi = i
+    while hi < a.size - 1 and a[hi] > h:
+        hi += 1
+    if hi - lo < 3:
+        return np.nan
+    w_lo = int(round(width_factor * (i - lo))); w_hi = int(round(width_factor * (hi - i)))
+    lo, hi = max(i - max(w_lo, 2), 0), min(i + max(w_hi, 2), a.size - 1)
+    u = np.degrees(np.unwrap(np.deg2rad(ph[lo:hi + 1])))
+    return float(u[-1] - u[0])
+
+
+def check_phase_convention(tune_data, expect_sign=+1.0, verbose=True):
+    """Confirm the raw Igor phase rotates the way PHASE_SIGN assumes.
+
+    Returns the measured phase change through the strongest peak (deg). Prints
+    loudly if its sign disagrees with `expect_sign` -- that would mean this
+    instrument or lock-in setting uses the other convention and PHASE_SIGN
+    must be set for this dataset, or the physics fit will see conjugated
+    spectra. Nothing is changed automatically: a silent flip is exactly the
+    kind of thing that hid this for months."""
+    dphi = phase_slope_through_peak(tune_data["frequency"], tune_data["amplitude"],
+                                    tune_data["phase"])
+    if np.isfinite(dphi) and abs(dphi) > 45 and np.sign(dphi) != np.sign(expect_sign):
+        print(f"    ** PHASE CONVENTION: raw phase changes {dphi:+.0f} deg through "
+              f"the strongest peak, but PHASE_SIGN={PHASE_SIGN:+.0f} assumes the "
+              f"opposite rotation. Set asylum.PHASE_SIGN for this dataset before "
+              f"any physics (EB) fit; low-rank results are unaffected.")
+    elif verbose and np.isfinite(dphi) and abs(dphi) <= 45:
+        print(f"    note: phase changes only {dphi:+.0f} deg through the strongest "
+              "peak -- too little to confirm the convention on this spectrum.")
+    return dphi
+
+
+def tune_to_complex(tune_data, band_Hz=None, drop_nonfinite=True,
+                    phase_sign=None, check_convention=False):
     """(freq, Z) from a tune dict, optionally cropped to ``band_Hz=(lo, hi)``.
 
-    Phase is stored in degrees by Igor; Z = amplitude * exp(i * phase).
+    Phase is stored in degrees by Igor; Z = amplitude * exp(i * phase_sign * phase),
+    with `phase_sign` defaulting to the module's PHASE_SIGN (see there for why it
+    is -1). Pass `check_convention=True` to verify the raw phase rotates the
+    expected way before trusting a complex fit.
 
     Igor commonly leaves the Amp/Phase waves NaN outside the range actually
     swept, while the Frequency wave stays fully populated. Those NaNs are poison
@@ -102,9 +174,12 @@ def tune_to_complex(tune_data, band_Hz=None, drop_nonfinite=True):
     axes. `drop_nonfinite` removes them here, at the boundary, so nothing
     downstream has to cope.
     """
+    sign = PHASE_SIGN if phase_sign is None else float(phase_sign)
     f = np.asarray(tune_data["frequency"], float)
     amp = np.asarray(tune_data["amplitude"], float)
     ph = np.asarray(tune_data["phase"], float)
+    if check_convention:
+        check_phase_convention(tune_data, expect_sign=-sign)
     if drop_nonfinite:
         good = np.isfinite(f) & np.isfinite(amp) & np.isfinite(ph)
         if not good.all():
@@ -117,7 +192,7 @@ def tune_to_complex(tune_data, band_Hz=None, drop_nonfinite=True):
             f, amp, ph = f[good], amp[good], ph[good]
         if f.size == 0:
             raise ValueError("tune contains no finite points")
-    Z = amp * np.exp(1j * np.deg2rad(ph))
+    Z = amp * np.exp(1j * sign * np.deg2rad(ph))
     if band_Hz is not None:
         lo, hi = float(band_Hz[0]), float(band_Hz[1])
         m = (f >= lo) & (f <= hi)
@@ -823,7 +898,7 @@ class AsylumInstrument(Instrument):
             self.apply_dc_bias()
 
     def apply_dc_bias(self):
-        """(Re-)apply the configured DC bias on Output.A.
+        """(Re-)apply the configured DC bias on TipBias.
 
         `close()` zeroes the bias, so call this before reusing the same
         instrument for a second acquisition (e.g. the dense reference sweep).
@@ -831,7 +906,7 @@ class AsylumInstrument(Instrument):
         position is tracked in software, so a fresh object has no idea where the
         spot actually is.
         """
-        self.a.igor.Execute(f'td_wv("Cypher.Output.A", {self.dc_bias_V})')
+        self.a.igor.Execute(f'td_wv("TipBias", {self.dc_bias_V})')
         time.sleep(1.0)
 
     # -- coordinate helpers ------------------------------------------------ #
@@ -940,9 +1015,9 @@ class AsylumInstrument(Instrument):
 
     # -- acquisition, split so one laser visit can serve many conditions -- #
     def set_dc_bias(self, volts, settle_s=1.0):
-        """Change the DC bias on Output.A without moving or re-engaging."""
+        """Change the DC bias on TipBias without moving or re-engaging."""
         self.dc_bias_V = float(volts)
-        self.a.igor.Execute(f'td_wv("Cypher.Output.A", {self.dc_bias_V})')
+        self.a.igor.Execute(f'td_wv("TipBias", {self.dc_bias_V})')
         time.sleep(settle_s)
         return self.dc_bias_V
 
@@ -1109,4 +1184,4 @@ class AsylumInstrument(Instrument):
 
     def close(self):
         self.a.withdraw()
-        self.a.igor.Execute('td_wv("Cypher.Output.A", 0)')
+        self.a.igor.Execute('td_wv("TipBias", 0)')

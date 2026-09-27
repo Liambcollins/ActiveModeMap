@@ -1,0 +1,2 @@
+[corrected] 241 pos, x 126.0-227.2 um, band 250-400 kHz (686 pts); phase through peak -136 deg; truth D-NS branch 225.88 / sign 225.81 um; sigma/max 9.4e-04
+[corrected] N= 3 | mode-A complex err  EB   13.3%  EB+GP  10.5%  LR  13.9% | EB amp   9.6%  phase MAE EB  3.6 EB+GP  2.6 LR  2.4 deg | D-NS(branch) err  EB -0.60 EB+GP +0.16 LR -95.46 | sign-change EB -0.53 EB+GP +0.35 LR +1.29 | f0 60.7 kHz contact 218.0 um zeta 0.0033 k*=458 N/m (171s)

@@ -90,7 +90,25 @@ class Condition:
         return base + (f", spot {self.spot}" if self.spot is not None else "")
 
 
-def make_conditions(bias_V, load_nN, vary="bias_inner", spots=None):
+def interleave_biases(bias_V):
+    """Reorder a bias list so consecutive values alternate in sign, largest
+    magnitude first: [-4..4] -> [0, 4, -4, 3, -3, 2, -2, 1, -1]. A monotonic
+    sweep confounds bias with time-within-position (the SCM-PIT 2026-08-10
+    series ran -6 -> +6 and could not separate a 10 % drift from the bias
+    slope); alternating signs turn a drift into scatter about the Z = a + bV
+    line instead of a bias slope."""
+    b = np.sort(np.atleast_1d(np.asarray(bias_V, float)))
+    zero = [v for v in b if abs(v) < 1e-12]
+    pos = [v for v in b if v > 0][::-1]
+    neg = [v for v in b if v < 0]
+    out = list(zero)
+    for i in range(max(len(pos), len(neg))):
+        if i < len(pos): out.append(pos[i])
+        if i < len(neg): out.append(neg[i])
+    return np.array(out)
+
+
+def make_conditions(bias_V, load_nN, vary="bias_inner", spots=None, bias_order="given"):
     """Build a condition list from bias and load values.
 
     `bias_V` and `load_nN` may be scalars or sequences. `vary='bias_inner'`
@@ -105,8 +123,17 @@ def make_conditions(bias_V, load_nN, vary="bias_inner", spots=None):
     `spots` (e.g. [1, 2] for two PPLN domains) is always the OUTERMOST loop:
     a sample-spot change costs a withdraw + scanner ramp + re-engage (~20-30 s),
     so all conditions at one spot are finished before hopping to the next.
+
+    `bias_order="interleaved"` alternates the sign of consecutive biases (see
+    `interleave_biases`) so that drift within a position cannot masquerade as
+    a bias slope. The condition list, not the sorted biases, is what the
+    checkpoint records, so analysis code is unaffected.
     """
     b = np.atleast_1d(np.asarray(bias_V, float))
+    if bias_order == "interleaved":
+        b = interleave_biases(b)
+    elif bias_order != "given":
+        raise ValueError("bias_order must be 'given' or 'interleaved'")
     l = np.atleast_1d(np.asarray(load_nN, float))
     sp = [None] if spots is None else [int(x) for x in np.atleast_1d(spots)]
     out = []
@@ -130,8 +157,16 @@ def make_conditions(bias_V, load_nN, vary="bias_inner", spots=None):
 def run_series(instrument, x_grid_um, conditions, ref_index=None, rank=4,
                min_positions=None, max_positions=20, dns_band_Hz=None,
                dns_ci_tol_um=1.0, stable_over=3, start_near_um=None,
-               checkpoint_path=None, resume=True, verbose=True):
+               checkpoint_path=None, resume=True, verbose=True,
+               positions_um=None):
     """Active-learning position selection, measuring every condition per position.
+
+    `positions_um`: a FIXED design instead of active learning. The positions are
+    measured in the order given (already-measured ones are skipped on resume),
+    there is no convergence stop, and `max_positions` is ignored. Use it for a
+    sparse equispaced survey or a dense cluster whose purpose is decided in
+    advance (2026-09-18: 8 positions across 75-445 um + a 2 um cluster at the
+    free end for the CR1 null-vs-bias measurement).
 
     One condition (`ref_index`, default the middle of the list) drives the
     position selection and the convergence test; every other condition is
@@ -179,10 +214,25 @@ def run_series(instrument, x_grid_um, conditions, ref_index=None, rank=4,
             print(f"resumed from {checkpoint_path}: {len(measured)} positions "
                   "already measured")
 
+    fixed = None
+    if positions_um is not None:
+        fixed = [float(v) for v in np.atleast_1d(np.asarray(positions_um, float))]
+        max_positions = len(fixed)
+        if verbose:
+            print(f"fixed design: {len(fixed)} positions, "
+                  f"{fixed[0]:.1f} -> {fixed[-1]:.1f} um; no convergence stop")
+
     t0 = time.time()
     consecutive_failures = 0
-    while mm.n < max_positions:
-        x = mm.next_position()
+    failed_x = set()
+    while mm.n < max_positions or (fixed is not None and any(v not in measured for v in fixed)):
+        if fixed is not None:
+            todo = [v for v in fixed if v not in measured and v not in failed_x]
+            if not todo:
+                break
+            x = todo[0]
+        else:
+            x = mm.next_position()
         if float(x) in measured:                     # already have it (resume)
             continue
         if verbose:
@@ -204,6 +254,7 @@ def run_series(instrument, x_grid_um, conditions, ref_index=None, rank=4,
             # setup, a code error in the instrument path) rather than one awkward
             # spot, so stop and let the traceback above be read.
             mm.block_position(x)
+            failed_x.add(float(x))
             consecutive_failures += 1
             print(f"  reference condition failed at x={x:.1f}; blocking this "
                   f"position ({consecutive_failures} consecutive failure(s))")
@@ -219,6 +270,13 @@ def run_series(instrument, x_grid_um, conditions, ref_index=None, rank=4,
         f_ref, Z_ref = got[ref_index][0], got[ref_index][1]
         mm.add_measurement(float(x), f_ref, Z_ref)
 
+        if fixed is not None:
+            if checkpoint_path:
+                save_checkpoint(checkpoint_path, measured, conditions, ref_index)
+            if verbose:
+                print(f"  {len(measured)}/{len(fixed)} fixed positions done "
+                      f"({(time.time() - t0) / 60:.1f} min elapsed)")
+            continue
         if mm.n >= mm.min_positions:
             rec = mm.reconstruct(nboot=150)
             if verbose:
@@ -271,6 +329,16 @@ def _pack(measured, conditions, ref_index):
 # --------------------------------------------------------------------------- #
 #  Checkpointing                                                              #
 # --------------------------------------------------------------------------- #
+def _phase_convention_tag():
+    """Tag for the phase convention data were built with. Read lazily so this
+    module stays importable where asylum's Windows deps are not installed."""
+    try:
+        from .asylum import PHASE_CONVENTION, PHASE_SIGN
+        return PHASE_CONVENTION if PHASE_SIGN < 0 else "igor-raw"
+    except Exception:
+        return "unknown"
+
+
 def save_checkpoint(path, measured, conditions, ref_index):
     d = _pack(measured, conditions, ref_index)
     tmp = path + ".tmp"
@@ -281,7 +349,8 @@ def save_checkpoint(path, measured, conditions, ref_index):
         np.savez_compressed(
             fh, x_um=d["x_um"], freq_Hz=d["freq_Hz"], Z=d["Z"],
             ref_index=ref_index,
-            conditions=json.dumps([asdict(c) for c in conditions]))
+            conditions=json.dumps([asdict(c) for c in conditions]),
+            phase_convention=_phase_convention_tag())
     os.replace(tmp, path)          # atomic: a crash mid-write cannot corrupt it
     return path
 
@@ -289,8 +358,15 @@ def save_checkpoint(path, measured, conditions, ref_index):
 def load_checkpoint(path):
     d = np.load(path, allow_pickle=False)
     conds = json.loads(str(d["conditions"]))
+    tag = str(d["phase_convention"]) if "phase_convention" in d.files else "igor-raw"
+    if tag != _phase_convention_tag():
+        print(f"    ** checkpoint {os.path.basename(path)} carries phase convention "
+              f"'{tag}' (current: '{_phase_convention_tag()}'). Its spectra are the "
+              "complex conjugate of what the physics fit expects; the low-rank path "
+              "does not care. Conjugate Z before any EB fit, or rebuild it.")
     return dict(x_um=d["x_um"], freq_Hz=d["freq_Hz"], Z=d["Z"],
-                ref_index=int(d["ref_index"]), conditions=conds)
+                ref_index=int(d["ref_index"]), conditions=conds,
+                phase_convention=tag)
 
 
 # --------------------------------------------------------------------------- #
