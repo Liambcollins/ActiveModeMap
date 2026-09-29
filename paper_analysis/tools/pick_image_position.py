@@ -49,11 +49,18 @@ def main():
     ap.add_argument("--tol_pct", type=float, default=3.0, help="max change of E over +-drift_um to call a position stable")
     ap.add_argument("--drift_um", type=float, default=2.0)
     ap.add_argument("--min_E", type=float, default=50.0)
+    ap.add_argument("--preflight", default=None, help="preflight_result.json of THIS capture: CR bands are set to 0.85-1.2 x its cr1/cr2/cr3 "
+                    "instead of the registry priors (use it whenever the contact differs from R2, e.g. CR1 350 kHz instead of 295)")
     a = ap.parse_args()
     probe = registry.PROBES[PROBE_KEY[a.probe]]
     s = load_series_file(a.capture, probe)
     cal = ebfit.load_calibration(a.probe, a.cal)
     x = s.x_um; f = s.freq_Hz; bands = dict(probe.bands_Hz); qs = tuple(probe.qs_band_Hz)
+    if a.preflight:
+        pf = json.load(open(a.preflight))
+        bands = {f"CR{i}": (0.85 * pf[f"cr{i}_Hz"], 1.2 * pf[f"cr{i}_Hz"]) for i in (1, 2, 3) if pf.get(f"cr{i}_Hz")}
+        bands = {k: v for k, v in bands.items() if v[0] < f.max()}
+        print("bands from pre-flight:", {k: (round(v[0] / 1e3), round(v[1] / 1e3)) for k, v in bands.items()}, "kHz")
     PF = two_domain_P(s)
     if PF is not None:
         Z, fZ = PF; src = "two-domain P (electrostatic channel removed)"
