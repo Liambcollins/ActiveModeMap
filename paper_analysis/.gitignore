@@ -1,0 +1,9 @@
+.venv/
+.venv-analysis/
+__pycache__/
+.ipynb_checkpoints/
+config.local.json
+figures/
+results/*
+!results/lever_calibration_*.json
+!results/.gitkeep
