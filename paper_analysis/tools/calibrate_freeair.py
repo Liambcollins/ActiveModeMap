@@ -34,24 +34,31 @@ import sim_calib_freeair as S  # noqa: E402  (Problem, make_je, contact_maps, fr
 
 PROBE_KEY = {"stiff": "scmpitB", "soft": "pppcontau", "multi75g": "multi75g"}
 FREE_MIN_HZ = 30e3
+GRID_IDX = None       # --grid_idx: subset of the contact-fit start grid (each start ~13 s on a laptop)
 
 
 # ------------------------------------------------------------------ step 1: free air
-def free_peaks(f, A, n=3, min_sep_frac=0.3):
-    """Strongest n peaks of the free-end amplitude spectrum above FREE_MIN_HZ, ranked, then sorted in f."""
-    m = f >= FREE_MIN_HZ; fi, ai = f[m], A[m]
-    order = np.argsort(ai)[::-1]; picked = []
-    for i in order:
-        if 0 < i < ai.size - 1 and not (ai[i] >= ai[i - 1] and ai[i] >= ai[i + 1]): continue
-        if all(abs(fi[i] - fi[j]) > min_sep_frac * max(fi[i], fi[j]) for j in picked): picked.append(i)
-        if len(picked) == n: break
-    out = []
-    for i in picked:                               # sub-bin refinement: parabola through log|A| at the three bins around the max
+def free_peaks(f, A, n=3, windows=((5.0, 7.5), (15.0, 20.0))):
+    """f1 = strongest peak above FREE_MIN_HZ; f2, f3 = strongest local maxima inside EB-guided windows
+    (f_n/f_1 in 5-7.5 and 15-20; uniform EB 6.27, 17.55). Ranking by raw amplitude alone picks the
+    band edge or electrical pickup (R3: a 36 kHz line at f1/2 is 5x stronger than f2)."""
+    def refine(fi, ai, i):
         if 0 < i < ai.size - 1:
-            y = np.log(ai[i - 1:i + 2]); d = (y[0] - y[2]) / (2 * (y[0] - 2 * y[1] + y[2])) if (y[0] - 2 * y[1] + y[2]) != 0 else 0.0
-            out.append(fi[i] + d * (fi[i + 1] - fi[i]))
-        else:
-            out.append(fi[i])
+            y = np.log(ai[i - 1:i + 2]); den = y[0] - 2 * y[1] + y[2]
+            return fi[i] + (0.5 * (y[0] - y[2]) / den if den != 0 else 0.0) * (fi[i + 1] - fi[i])
+        return fi[i]
+    def strongest_local_max(lo, hi):
+        m = (f >= lo) & (f <= hi); fi, ai = f[m], A[m]
+        if ai.size < 3: return None
+        loc = np.flatnonzero((ai[1:-1] >= ai[:-2]) & (ai[1:-1] >= ai[2:])) + 1
+        if loc.size == 0: return None
+        i = loc[np.argmax(ai[loc])]
+        return refine(fi, ai, i)
+    f1 = strongest_local_max(FREE_MIN_HZ, f.max())
+    out = [f1]
+    for (a, b) in windows[:n - 1]:
+        fn = strongest_local_max(a * f1, min(b * f1, f.max()))
+        if fn is not None: out.append(fn)
     return np.sort(out)
 
 
@@ -116,7 +123,9 @@ def fit_contact(x, caps, P_free, geom_free, starts=6, seed=0, free_data=None):
     r = np.random.default_rng(seed); best = None
     ref = P_free
     grid = [(ref["setback_um"], ref["tip_h_um"], ref["log_kcone"])] + [(sb, th, 2.9) for sb in (2.0, 4.0, 8.0, 14.0) for th in (4.0, 8.0, 15.0)]
-    for st in range(max(starts, len(grid))):
+    if GRID_IDX: grid = [grid[i] for i in GRID_IDX]; starts = len(grid)
+    n_st = max(starts, len(grid)) if any(k in geom_free for k in ("setback_um", "tip_h_um", "log_kcone")) else 1   # nothing to vary -> one start
+    for st in range(n_st):
         P0 = dict(P_free)
         sb, th, kc = grid[st] if st < len(grid) else (float(np.clip(r.uniform(1.5, 12), 1.1, 39)), float(r.uniform(4, 15)), r.uniform(2.0, 3.5))
         if "setback_um" in geom_free: P0["setback_um"] = sb
@@ -160,6 +169,14 @@ def run(a):
     xf = np.asarray(d["x_um"], float); ff = np.asarray(d["freq_Hz"], float)
     A = np.abs(np.asarray(d["Z"])) if "Z" in d.files else np.asarray(d["amplitude"], float)
     o = np.argsort(xf); xf, A = xf[o], A[o]
+    if a.survey:                                    # keep only walk positions that the survey also visited (R3: 42 um has no survey)
+        xs_chk = load_series_file(a.survey, registry.PROBES[PROBE_KEY[a.probe]]).x_um
+        keep = np.array([np.min(np.abs(xs_chk - v)) < 0.6 for v in xf])
+        if not keep.all(): print("free-air positions without a survey point dropped:", xf[~keep])
+        xf, A = xf[keep], A[keep]
+    ok = np.array([a_.max() > 30 * np.median(a_) for a_ in A])   # R3: the 232 um tune came back empty (flat 1.2e-6)
+    if not ok.all(): print("free-air positions with an empty spectrum dropped:", xf[~ok])
+    xf, A = xf[ok], A[ok]
     i_end = int(np.argmax(xf)); fpk = free_peaks(ff, A[i_end]); prof = free_profiles(ff, A, fpk)
     if len(fpk) < 3: raise SystemExit(f"need three free modes in the walk, found {np.round(fpk/1e3,1)} kHz -- raise the drive/DC bias or widen the tune window")
     print("free-air peaks at the free end (kHz):", np.round(fpk / 1e3, 2), " ratios", np.round(fpk / fpk[0], 3), "(uniform EB 1 : 6.267 : 17.548)")
@@ -185,8 +202,10 @@ def run(a):
     # JOINT fit: the free-air residuals (ladder + shapes) enter alongside the contact spectra. A tip mass at the
     # very tip shifts every free mode by the same fraction, so free air alone cannot separate mu from the free-beam
     # scale f0s; the contact modes (tip pinned, insensitive to mu) do. Free-air positions must be the survey positions.
-    if not np.allclose(np.sort(xf), np.sort(xs), atol=0.6): raise SystemExit("free-air walk and survey must use the same positions")
-    prof_n = prof / np.sqrt(np.mean(prof ** 2, axis=1, keepdims=True))
+    if len(xf) != len(xs) or not np.allclose(np.sort(xf), np.sort(xs), atol=0.6):
+        keep = np.array([np.min(np.abs(xf - v)) < 0.6 for v in xs]); print("survey positions without a free-air spectrum are fitted but get no free-air term:", xs[~keep])
+        prof = np.array([[prof[j][np.argmin(np.abs(xf - v))] if k else np.nan for v, k in zip(xs, keep)] for j in range(len(prof))]); xf = xs.copy()
+    prof_n = prof / np.sqrt(np.nanmean(prof ** 2, axis=1, keepdims=True))
     free_data = (fpk, prof_n[:, np.argsort(xf)])
     J.SHARED["c_um"] = (P_fa["c_um"], P_fa["c_um"] - 10, P_fa["c_um"] + 10)
     # mu and the free-beam scale f0s are degenerate in free air (a mass AT the tip shifts every free mode alike) and the
@@ -290,5 +309,7 @@ if __name__ == "__main__":
     ap.add_argument("--probe", default="stiff", choices=PROBE_KEY); ap.add_argument("--cal", default="mass"); ap.add_argument("--starts", type=int, default=6)
     ap.add_argument("--selftest", action="store_true"); ap.add_argument("--use_ladder", action="store_true"); ap.add_argument("--mismatch", type=float, default=0.0); ap.add_argument("--fix_f0s", action="store_true")
     ap.add_argument("--mu", type=float, default=None, help="tip-mass prior m_tip/m_beam (default: reference calibration)"); ap.add_argument("--free_mu", action="store_true")
+    ap.add_argument("--grid_idx", default=None, help="comma list of start-grid indices, e.g. 0,3,6,8,9")
     a = ap.parse_args()
+    if a.grid_idx: GRID_IDX = [int(v) for v in a.grid_idx.split(",")]
     (selftest if a.selftest else run)(a)

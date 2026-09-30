@@ -147,6 +147,9 @@ class Problem:
         if self.free_data is not None:
             f_meas, sh_meas = self.free_data; f, sh = free_air(P, self.x)
             res.append((f - f_meas) / (FREE_F_NOISE * f_meas))
+            msk = np.all(np.isfinite(sh_meas), axis=0)        # positions without a free-air spectrum carry no shape term
+            if not msk.all():
+                sh = sh[:, msk] / np.sqrt(np.mean(sh[:, msk] ** 2, axis=1, keepdims=True)); sh_meas = sh_meas[:, msk]
             res.append(((sh - sh_meas) / FREE_A_NOISE).ravel())
         out = np.concatenate(res); self._n = out.size
         return out
