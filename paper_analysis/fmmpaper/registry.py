@@ -46,6 +46,16 @@ PROBES = {
         qs_band_Hz=(5e3, 25e3),
         notes="Sep 17-20 2026, PPLN DomainsB, 15-250 nN. Band centres on the 1 um map (100 nN): "
               "65.0/201.8/414.1/694.5/1023.8 kHz (CR5 was mis-registered at 880-960 kHz before 2026-09-27)."),
+    "multi75g": Probe(
+        key="multi75g", name="Multi75-G (BudgetSensors Multi75G, Cr/Pt; folders named DomainsB_SCMPIT_R3/R4)",
+        k_N_per_m=1.906, f0_free_Hz=72.90e3, L_um=236.4, clamp_offset_um=-4.4,
+        # pre-flight 29 Sep 2026: CR1 377.6 kHz, CR2 1144 kHz at 350 nN (CR3 ~2.1 MHz, outside the 2 MHz window)
+        bands_Hz={"CR1": (320e3, 434e3), "CR2": (973e3, 1200e3)},
+        qs_band_Hz=(15e3, 45e3),
+        notes="Sep 29-30 2026, PPLN DomainsB, 350/700 nN. k thermal 1.906 N/m (Sader 1.85); free f1 72.90 kHz "
+              "(free-air walk), f2 465.9, f3 1317.4 kHz. SEM 25 Sep 2026 (Used_Budget75_260925): L 236.4 um, "
+              "width 35.1 um, tip set-back ~14 um from the pointed end, tip height ~15 um (datasheet 17). "
+              "Stage bookkeeping put the free end at 232 um -> clamp at about -4.4 um stage."),
     "scmpitA": Probe(
         key="scmpitA", name="SCM-PIT-A (SCM-PIT, Multi75G nominal geometry)",
         k_N_per_m=2.387, f0_free_Hz=None, L_um=225.0, clamp_offset_um=0.0,

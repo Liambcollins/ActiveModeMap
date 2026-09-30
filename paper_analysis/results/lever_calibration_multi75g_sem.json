@@ -1,0 +1,39 @@
+{
+ "probe": "multi75g",
+ "dataset": "SEM prior (Used_Budget75_260925) + free-air walk; no dense map",
+ "f0_hz": 72900.0,
+ "n_modes": 14,
+ "N_fit": 0,
+ "sel": [],
+ "free": [],
+ "P": {
+  "log_alpha": 3.0,
+  "log_kcone": 2.9,
+  "log_Qc": 2.0,
+  "setback_um": 14.0,
+  "tip_h_um": 15.0,
+  "c_um": -4.4,
+  "L_um": 236.4,
+  "mu": 0.003,
+  "J": 0.0
+ },
+ "zeta": [
+  0.002,
+  0.001
+ ],
+ "eps": [
+  0.0,
+  0.0
+ ],
+ "dlf": [
+  0.0,
+  0.0
+ ],
+ "bands": [
+  "CR1",
+  "CR2"
+ ],
+ "score": [],
+ "cost": null,
+ "notes": "Starting/prior geometry from SEM: L 236.4 um (annotated), tip apex ~14 um from the pointed end, tip height ~15 um (apparent 11.3 um in an inclined view; datasheet 17). c from stage bookkeeping (free end at 232). Refined by calibrate_freeair.py."
+}
