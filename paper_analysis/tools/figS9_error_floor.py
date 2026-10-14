@@ -12,7 +12,8 @@ from matplotlib.patches import Patch
 from fmmpaper import style3 as S, config
 
 S.setup()
-d = np.load(config.RESULTS_DIR / "err_concept_soft.npz")
+PRIOR = sys.argv[1] if len(sys.argv) > 1 else "dense"
+d = np.load(config.RESULTS_DIR / f"err_concept_soft{'_sem' if PRIOR == 'sem' else ''}.npz")
 NS = d["NS"]; names = list(d["names"]); fl = json.loads(str(d["floor"]))
 ARMS = [("EB", "beam model", S.MODEL, "-"), ("EB+GP", "hybrid", S.MAP, "-"), ("low-rank", "polynomial", S.POLY, "--")]
 G = lambda a, k: d[f"{a}|{k}"]
@@ -56,4 +57,4 @@ fig.legend(handles=[plt.Line2D([], [], color=c, ls=ls, **mk, label=l) for _, l, 
               plt.Line2D([], [], color=S.GREY, lw=0.6, ls=":", label="map pitch (1 µm)"),
               plt.Line2D([], [], ls="none", marker="^", mfc="white", mec=S.INK, mew=0.7, ms=3.4, label="off scale")],
            loc="upper center", ncol=6, bbox_to_anchor=(0.5, 1.0), handlelength=1.8)
-S.save(fig, "FigS9_error_floor")
+S.save(fig, f"FigS9_error_floor{'_sem' if PRIOR == 'sem' else ''}")

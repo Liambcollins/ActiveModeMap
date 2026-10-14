@@ -6,15 +6,16 @@ import numpy as np
 from scipy.ndimage import uniform_filter1d
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fmmpaper as F
-from fmmpaper import ebfit, physrec, recon
+from fmmpaper import ebfit, physrec, recon, semprior
+PRIOR = sys.argv[1] if len(sys.argv) > 1 else "dense"
 
 NS = [3, 4, 5, 6, 8, 10, 12, 16, 20]
 X0 = -19.0
-OUT = F.config.RESULTS_DIR / "err_concept_soft.npz"
+OUT = F.config.RESULTS_DIR / f"err_concept_soft{'_sem' if PRIOR == 'sem' else ''}.npz"
 
 s = F.load("ppp_dense_1um"); xs, f, Z = s.x_um, s.freq_Hz, s.Z[0]; x = xs - X0
 bands = dict(s.probe.bands_Hz); names = list(bands)
-cal = ebfit.load_calibration("soft", "mass")
+cal, FREE = (semprior.calibration("soft", X0) if PRIOR == "sem" else (ebfit.load_calibration("soft", "mass"), ebfit.FREE_DEFAULT))
 M = {b: (f >= bands[b][0]) & (f <= bands[b][1]) for b in names}
 Zb = {b: Z[:, M[b]] for b in names}; fbn = {b: f[M[b]] for b in names}
 del Z
@@ -80,7 +81,7 @@ for iN, N in enumerate(NS):
         # decimate the band exactly as in fig_recovery_vs_N (band_slice on the full-f array)
         fullf = f; Zfull = np.zeros((len(x), fullf.size), complex); Zfull[:, M[b]] = Zb[b]
         zb, fb = physrec.band_slice(fullf, Zfull, bands[b], n_max=250); del Zfull
-        o = ebfit.rec_eb2(xs, sel, zb[sel], fb, cal, b)
+        o = ebfit.rec_eb2(xs, sel, zb[sel], fb, cal, b, free=FREE)
         rec = {"EB": interp(fbn[b], fb, o["Zeb"]), "EB+GP": interp(fbn[b], fb, o["Zrec"]),
                "low-rank": recon.rec_lowrank(x, sel, Zb[b][sel], rank=min(6, N))["Zrec"]}
         for a in ARMS:

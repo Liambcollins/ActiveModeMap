@@ -24,7 +24,7 @@ from matplotlib.patches import Patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fmmpaper as F  # noqa: E402
-from fmmpaper import ebfit, physrec, recon, spectra, plotting as fp  # noqa: E402
+from fmmpaper import ebfit, physrec, recon, spectra, semprior, plotting as fp  # noqa: E402
 
 NS = [4, 6, 9, 12]
 ARMS = ["EB", "EB+GP", "low-rank"]
@@ -35,15 +35,16 @@ PROBES = {   # key, clamp in stage um (lever frame = stage - x0), calibration, b
     "soft": dict(key="ppp_dense_1um", x0=-19.0, cal="soft", show=["CR1", "CR3", "CR5"], frange=(40, 1090), xstar=270.0, label="346 positions, 1 µm pitch"),
     "stiff": dict(key="scmpitB_r2_dense", x0=28.1, cal="stiff", show=["CR1", "CR2", "CR3"], frange=(240, 1910), xstar=120.0, label="161 positions, 1 µm pitch"),
 }
-PROBE = "soft"
-CACHE = lambda: F.config.RESULTS_DIR / f"fig_recovery_vs_N_{PROBE}.npz"
+PROBE = "soft"; PRIOR = "dense"
+CACHE = lambda: F.config.RESULTS_DIR / f"fig_recovery_vs_N_{PROBE}{'_sem' if PRIOR == 'sem' else ''}.npz"
 
 
 def compute(cal_tag="mass", rank=6):
     P = PROBES[PROBE]
     s = F.load(P["key"]); xs, f, Z = s.x_um, s.freq_Hz, s.Z[0]; x = xs - P["x0"]
     bands = dict(s.probe.bands_Hz); names = list(bands)
-    cal = ebfit.load_calibration(P["cal"], cal_tag)
+    if PRIOR == "sem": cal, free = semprior.calibration(P["cal"], P["x0"])
+    else: cal, free = ebfit.load_calibration(P["cal"], cal_tag), ebfit.FREE_DEFAULT
     masks = {b: (f >= bands[b][0]) & (f <= bands[b][1]) for b in names}
     span = np.zeros(f.size, bool)
     for m in masks.values(): span |= m
@@ -56,7 +57,7 @@ def compute(cal_tag="mass", rank=6):
         eb = np.full(Z.shape, np.nan + 0j); ebgp = eb.copy(); sd = np.full(Z.shape, np.nan)
         for b in names:
             zb, fb = physrec.band_slice(f, Z, bands[b], n_max=250)
-            o = ebfit.rec_eb2(xs, sel, zb[sel], fb, cal, b)
+            o = ebfit.rec_eb2(xs, sel, zb[sel], fb, cal, b, free=free)
             m = masks[b]
             eb[:, m] = interp(f[m], fb, o["Zeb"]); ebgp[:, m] = interp(f[m], fb, o["Zrec"])
             sd[:, m] = np.apply_along_axis(lambda r: np.interp(f[m], fb, r), 1, o["sd"])
@@ -297,14 +298,14 @@ def plot_v3(out, name):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--replot", action="store_true"); ap.add_argument("--probe", default="soft", choices=PROBES)
-    ap.add_argument("--err_scale", default="log", choices=["log", "linear"]); ap.add_argument("--v3", action="store_true")
-    a = ap.parse_args(); PROBE = a.probe
+    ap.add_argument("--err_scale", default="log", choices=["log", "linear"]); ap.add_argument("--v3", action="store_true"); ap.add_argument("--prior", default="dense", choices=["dense", "sem"])
+    a = ap.parse_args(); PROBE = a.probe; PRIOR = a.prior
     if a.replot and CACHE().exists():
         out = load()
     else:
         out = compute(); save(out)
     ap2 = a
     if getattr(ap2, "v3", False):
-        plot_v3(out, f"Fig2_sparse_reconstruction_{PROBE}")
+        plot_v3(out, f"Fig2_sparse_reconstruction_{PROBE}{'_sem' if PRIOR == 'sem' else ''}")
     else:
         plot(out, F.config.FIG_DIR / f"fig_recovery_vs_N_{PROBE}{'' if a.err_scale == 'log' else '_linear'}.png", err_scale=a.err_scale)
