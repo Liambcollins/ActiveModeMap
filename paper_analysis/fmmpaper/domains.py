@@ -60,14 +60,32 @@ def split_spots(s: Series, spots=(1, 2)):
     return i1, V1, i2, V2
 
 
-def decompose_series(s: Series, band=None, spots=(1, 2)) -> dict:
+def align_peaks(s: Series, band="CR1", ref_bias: float = 0.0, ref_spot: int = 1, pad_Hz: float = 5e3):
+    """Z with every condition's spectrum shifted in frequency, inside ``band`` (+- pad), so that its CR peak sits at the
+    peak of the (ref_bias, ref_spot) spectrum of the same position. This is the frequency-resolved form of the peak-tracked
+    reading in transfer_table(track=True): at the peak bin the two coincide. Returns (Z_aligned, shift_Hz[cond, pos])."""
+    from . import spectra as _sp
+    f = s.freq_Hz; bl = s.probe.bands_Hz[band]; m = (f >= bl[0] - pad_Hz) & (f <= bl[1] + pad_Hz); fb = f[m]
+    iref = int(np.intersect1d(s.where(bias_V=ref_bias), s.where(spot=ref_spot))[0])
+    Z = s.Z.copy(); sh = np.zeros((s.Z.shape[0], len(s.x_um)))
+    for j in range(len(s.x_um)):
+        f0 = _sp.peak(f, s.Z[iref, j], bl)["f_Hz"]
+        for c in range(s.Z.shape[0]):
+            df = f0 - _sp.peak(f, s.Z[c, j], bl)["f_Hz"]; sh[c, j] = df; z = s.Z[c, j, m]
+            Z[c, j, m] = np.interp(fb - df, fb, z.real) + 1j * np.interp(fb - df, fb, z.imag)
+    return Z, sh
+
+
+def decompose_series(s: Series, band=None, spots=(1, 2), align_band=None) -> dict:
     """Frequency-resolved decomposition of a two-domain bias survey.
 
-    Returns arrays shaped [position, freq] (restricted to ``band`` if given).
+    Returns arrays shaped [position, freq] (restricted to ``band`` if given). ``align_band="CR1"`` first aligns every
+    condition's CR1 peak to the 0 V / domain-1 peak of that position (peak-tracked maps, see align_peaks).
     """
     i1, V1, i2, V2 = split_spots(s, spots)
     m = s.band(band) if band is not None else np.ones(s.freq_Hz.size, bool)
-    out = decompose(V1, s.Z[i1][:, :, m], V2, s.Z[i2][:, :, m])
+    Z = align_peaks(s, align_band)[0] if align_band else s.Z
+    out = decompose(V1, Z[i1][:, :, m], V2, Z[i2][:, :, m])
     out["freq_Hz"] = s.freq_Hz[m]
     out["x_um"] = s.x_um
     return out

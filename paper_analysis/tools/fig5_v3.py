@@ -30,6 +30,11 @@ k = AD.used.values; ib = int(np.argmin(AD.ratio_qs.values))
 SM.loc[AD_LAB] = dict(load_nN=750, raw_median=float(np.median(AD.d33_qs[k])), d33_uniform=float(np.median(AD.d33_qs_stuckcorr[k])),
                       d33_blind_spot_raw=float(AD.d33_qs[ib]), cr1_model_median=float(np.median(AD.d33_cr1_stuck[k])))
 
+# 2026-10-14: model-route squares = SEM-geometry recipe on every probe, peak-tracked E (tools/model_route_sem.py)
+MR = pd.read_csv(R / "r3r4/model_route_sem.csv"); MJ = json.load(open(R / "r3r4/model_route_sem.json"))
+X = X.drop(columns=["d33_cr1_model"]).merge(MR[["dataset", "x_stage_um", "d33_cr1_model", "used"]].rename(columns={"x_stage_um": "x_um", "used": "used_mr"}), on=["dataset", "x_um"], how="left")
+X["used"] = X.used & X.used_mr.fillna(False).astype(bool)
+for d_, v in MJ.items(): SM.loc[d_, "cr1_model_median"] = v["d33_model_median"]
 ORDER = ["PPP-CONTAu (15 nN)", "PPP-CONTAu (250 nN)", "Multi75-G R3 (350 nN)", "SCM-PIT R1 (500 nN)", "SCM-PIT R2 (500 nN)", AD_LAB]
 probe = lambda d: d.split(" ")[0]
 MK = {"PPP-CONTAu (15 nN)": "o", "PPP-CONTAu (250 nN)": "s", "Multi75-G R3 (350 nN)": "D", "SCM-PIT R1 (500 nN)": "^", "SCM-PIT R2 (500 nN)": "o", AD_LAB: "v"}
@@ -59,9 +64,10 @@ axa.legend(handles=[Line2D([], [], color=S.GREY, marker="o", mfc="white", ls="",
                     Line2D([], [], color=S.QS, marker="o", ls="", ms=4, label="QS, domain-CPD corrected"),
                     Line2D([], [], color=S.QS, marker="v", ls="", ms=4.6, label="QS, tip-pinning corrected"),
                     Line2D([], [], color=S.INK, marker="*", ls="", ms=6.5, label="QS at tip blind spot"),
-                    Line2D([], [], color=S.MODEL, marker="s", ls="", ms=3.6, label="CR1 ÷ lever-model E")],
+                    Line2D([], [], color=S.MODEL, marker="s", ls="", ms=3.6, label="CR1 ÷ E, SEM-geometry beam model")],
            loc="lower center", ncol=3, columnspacing=0.9, handletextpad=0.4, bbox_to_anchor=(0.5, 1.0), fontsize=6.3)
 axa.text(1 + off["model"] + 0.07, 11.6, "model fails", fontsize=6.5, ha="left", va="center", color=S.MODEL)
+axa.text(2 + off["model"] + 0.07, 9.3, "2 CRs:\nunder-\ndetermined", fontsize=5.8, ha="left", va="center", color=S.MODEL, linespacing=1.0)
 axa.text(5 + off["raw"] - 0.1, 13.6, "×1.7 along\nthe lever", fontsize=6.0, ha="right", va="center", color=S.GREY, linespacing=1.0)
 S.label(axa, "a", dx=-0.115)
 # (b)

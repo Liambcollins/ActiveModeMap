@@ -19,6 +19,10 @@ R = F.config.RESULTS_DIR
 T = pd.DataFrame(json.load(open(R / "fig6_main.json"))["values"]["runs"]["R2"]["table"])
 Bq = np.load(R / "r2_bias_qs.npz"); SUM = pd.read_csv(R / "r3r4/xprobe_summary.csv").set_index("dataset").loc["SCM-PIT R2 (500 nN)"]
 x = T.x_lever_um.values; D_UNI, D_TIP = float(SUM.d33_uniform), float(SUM.d33_blind_spot_raw)
+# 2026-10-14: model route = SEM-geometry recipe, peak-tracked / peak-aligned two-domain maps (tools/fig_e_routes_tracked.py)
+FS = json.load(open(R / "fig_e_routes_sem_summary.json")); assert np.allclose(FS["x_lever"], x, atol=0.2)
+T["d33_cr_eb"] = np.array(FS["d33_cr_model"]); T["E"] = np.array(FS["E_meas_tracked"]); T["d33_qs"] = np.array(FS["d33_qs_stat"])
+T["d33_cr_over_Q"] = T["d33_qs"] * T["E"] / T["Q"]
 
 S.setup(); fig = S.figure(56)
 axs = [fig.add_axes([0.06 + 0.245 * k, 0.2, 0.18, 0.7]) for k in range(4)]
@@ -64,9 +68,10 @@ ax.plot(x, T.d33_cr_eb, "s-", color=S.MODEL, ms=3.2, lw=0.9)
 cq = np.clip(T.d33_cr_over_Q, 0, 12.5); ax.plot(x, cq, "^:", color=S.GREY, ms=3, lw=0.8)
 ax.plot(x[-1], D_TIP, "*", color=S.INK, ms=7, zorder=5)
 ax.text(205, 7.75 + 0.55, "QS", color=S.QS, ha="right", va="bottom")
-ax.text(42, 0.6, f"CR1 ÷ E$_{{model}}$ (median {np.median(T.d33_cr_eb):.2f})", color=S.MODEL, va="bottom")
+kk = x < 205
+ax.text(42, 0.6, f"CR1 ÷ E$_{{model}}$ (median {np.median(T.d33_cr_eb[kk]):.2f})", color=S.MODEL, va="bottom")
 ax.text(150, 11.0, "CR1 ÷ Q", color=S.GREY, ha="left")
 ax.set_ylim(0, 12.5); ax.set_xlim(35, 220); ax.set_xlabel("distance from clamp x (µm)"); ax.set_ylabel(S.deff_label())
 S.label(ax, "d", dx=-0.3)
 S.save(fig, "Fig4_domain_calibration")
-print("model median", np.median(T.d33_cr_eb), "sd %", 100 * np.std(T.d33_cr_eb) / np.median(T.d33_cr_eb))
+print("model median (x<205)", np.median(T.d33_cr_eb[kk]), "sd %", 100 * np.std(T.d33_cr_eb[kk]) / np.mean(T.d33_cr_eb[kk]), "QS median", np.median(T.d33_qs))
