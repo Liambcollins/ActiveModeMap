@@ -38,8 +38,8 @@ from . import config, recon, spectra
 from . import jointeb as J
 
 FREE_DEFAULT = ("log_alpha", "log_zeta", "eps")
-BOUNDS = {"log_alpha": (1.0, 5.0), "log_kcone": (-1.0, 4.0), "log_Qc": (0.3, 4.0), "log_zeta": (-4.0, -1.0), "eps": (-5.0, 5.0), "c_um": None}
-X_SCALE = {"log_alpha": 0.1, "log_kcone": 0.3, "log_Qc": 0.3, "log_zeta": 0.2, "eps": 0.2, "c_um": 2.0}
+BOUNDS = {"log_alpha": (1.0, 5.0), "log_kcone": (-1.0, 4.0), "log_Qc": (0.3, 4.0), "log_zeta": (-4.0, -1.0), "eps": (-5.0, 5.0), "c_um": None, "mu": (0.0, 0.2), "J": (0.0, 0.02)}
+X_SCALE = {"log_alpha": 0.1, "log_kcone": 0.3, "log_Qc": 0.3, "log_zeta": 0.2, "eps": 0.2, "c_um": 2.0, "mu": 0.01, "J": 0.001}
 C_HALF_RANGE_UM = 15.0   # "c_um" (clamp position in stage units, laser-frame drift) may move this far from the calibration
 
 
@@ -74,7 +74,7 @@ class _OneBand:
     def P(self, v):
         P = dict(self.P0)
         for k, val in zip(self.free, v):
-            if k in ("log_alpha", "log_kcone", "log_Qc", "c_um"):
+            if k in ("log_alpha", "log_kcone", "log_Qc", "c_um", "mu", "J"):
                 P[k] = float(val)
         return P
 
@@ -139,7 +139,7 @@ def rec_eb2(x_stage_um, sel, Z_sel, f_Hz, cal, band, free=FREE_DEFAULT, dlf=0.0,
             for e0 in e_starts:
                 v0 = []
                 for k in free:
-                    v0.append({"log_alpha": la, "log_zeta": lz, "eps": e0, "log_kcone": ob.P0["log_kcone"], "log_Qc": ob.P0.get("log_Qc"), "c_um": ob.P0["c_um"]}[k])
+                    v0.append({"log_alpha": la, "log_zeta": lz, "eps": e0, "log_kcone": ob.P0["log_kcone"], "log_Qc": ob.P0.get("log_Qc"), "c_um": ob.P0["c_um"], "mu": ob.P0.get("mu", 0.0018), "J": ob.P0.get("J", 0.0)}[k])
                 v0 = np.clip(np.array(v0, float), lo + 1e-6, hi - 1e-6)
                 r = least_squares(ob.residual, v0, bounds=(lo, hi), method="trf", x_scale=xs,
                                   ftol=1e-9, xtol=1e-9, max_nfev=max_nfev)
