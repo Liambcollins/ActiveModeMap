@@ -56,6 +56,15 @@ PROBES = {
               "(free-air walk), f2 465.9, f3 1317.4 kHz. SEM 25 Sep 2026 (Used_Budget75_260925): L 236.4 um, "
               "width 35.1 um, tip set-back ~14 um from the pointed end, tip height ~15 um (datasheet 17). "
               "Stage bookkeeping put the free end at 232 um -> clamp at about -4.4 um stage."),
+    "adama": Probe(
+        key="adama", name="Adama AD-2.8-AS (boron-doped diamond tip; folders DomainsB_ADAMA_R1/R2)",
+        k_N_per_m=3.5299, f0_free_Hz=58.41e3, L_um=246.7, clamp_offset_um=0.0,
+        # R1 pre-flight 30 Sep 2026 at 750 nN: CR1 348.3, CR2 996.3, CR3 1976.9 kHz (R2: 335.0 / ~1009 / 1882)
+        bands_Hz={"CR1": (300e3, 400e3), "CR2": (930e3, 1070e3), "CR3": (1820e3, 2000e3)},
+        qs_band_Hz=(15e3, 45e3),
+        notes="Sep 30 - Oct 2 2026, PPLN DomainsB, 750 nN. k thermal 3.53 N/m (R1) / 3.35 (R2); free f0 58.41 / 61.03 kHz. "
+              "SEM (Adama_T2/T5, averaged): L 246.7 um, width 52.5 um, tip set-back 21.2 um, tip height 14.6 um. "
+              "clamp_offset_um 0 is a placeholder: the lever frame is fitted from the pre-flight InvOLS ruler."),
     "scmpitA": Probe(
         key="scmpitA", name="SCM-PIT-A (SCM-PIT, Multi75G nominal geometry)",
         k_N_per_m=2.387, f0_free_Hz=None, L_um=225.0, clamp_offset_um=0.0,

@@ -201,12 +201,110 @@ def plot(out, path, err_scale="log"):
     print("wrote", path)
 
 
+def plot_v3(out, name):
+    """v3 style: 7 pt, coolwarm map, method colours shared with Fig. 3 (beam model amber, hybrid teal, polynomial purple)."""
+    from fmmpaper import style3 as S
+    P = PROBES[PROBE]; SHOW_BANDS = P["show"]
+    x, f, Z, span, names = out["x"], out["f"], out["Z"], out["span"], out["names"]
+    bands = dict(F.load(P["key"]).probe.bands_Hz)
+    masks = {b: (f >= bands[b][0]) & (f <= bands[b][1]) for b in names}
+    ipos = pick_position(out); S.setup()
+    LAB = {"EB": "beam model", "EB+GP": "hybrid", "low-rank": "polynomial"}
+    COL = {"EB": S.MODEL, "EB+GP": S.MAP, "low-rank": S.POLY}; LS = {"EB": "-", "EB+GP": "-", "low-rank": "--"}
+    fig = S.figure(200)
+    gs = fig.add_gridspec(4, 1, height_ratios=[1.0, 0.07, 0.62, 0.62], hspace=0.5)
+    top = gs[0].subgridspec(1, 2, width_ratios=[0.95, 2.05], wspace=0.25)
+    ga = top[0].subgridspec(2, 1, height_ratios=[0.34, 1], hspace=0.04)
+    axd = fig.add_subplot(ga[0]); axa = fig.add_subplot(ga[1])
+    fp.map_db(axa, x, f, Z, colorbar=False, fmin=P["frange"][0], fmax=P["frange"][1], cmap=S.MAP_CMAP); S.boxes(axa)
+    axa.set_xlabel("distance from clamp x (µm)"); axa.set_ylabel("frequency (kHz)")
+    for b in names:
+        axa.annotate(b, (x.max() - 0.015 * np.ptp(x), np.mean(bands[b]) / 1e3), xytext=(0, -4 if b == names[-1] else 4),
+                     textcoords="offset points", ha="right", va="top" if b == names[-1] else "bottom")
+    axa.axvline(x[ipos], color="k", lw=0.6, ls=":")
+    for k, N in enumerate(NS):
+        axd.plot(x[out["sel"][N]], np.full(N, k), "v", color="k", ms=3, mec="none")
+        axd.text(x.min() - 4, k, f"N = {N}", ha="right", va="center")
+    axd.set_xlim(axa.get_xlim()); axd.set_ylim(-0.7, len(NS) - 0.3); axd.axis("off"); axd.invert_yaxis()
+    axd.set_title(f"dense reference, {P['label']}", pad=2)
+    S.label(axd, "a", dx=-0.3, dy=1.1)
+    gb = top[1].subgridspec(len(NS), len(ARMS), hspace=0.22, wspace=0.08)
+    from matplotlib.colors import Normalize
+    norm = Normalize(0, 60); ims = None
+    for i, N in enumerate(NS):
+        h = recon.held_out(len(x), out["sel"][N])
+        for j, a in enumerate(ARMS):
+            ax = fig.add_subplot(gb[i, j]); zr = out["Zrec"][N][a]; S.boxes(ax)
+            E = np.array([[100 * np.sqrt(np.mean(np.abs(zr[p][masks[b]] - Z[p][masks[b]]) ** 2) / np.mean(np.abs(Z[:, masks[b]]) ** 2))
+                           for p in range(len(x))] for b in names])
+            xe = np.concatenate([[x[0] - 0.5], 0.5 * (x[1:] + x[:-1]), [x[-1] + 0.5]])
+            ims = ax.pcolormesh(xe, np.arange(len(names) + 1), np.clip(E, 0, 60), cmap=S.ERR_CMAP, norm=norm, shading="flat", rasterized=True)
+            for xs in x[out["sel"][N]]: ax.axvline(xs, color="k", lw=0.35, alpha=0.5)
+            tot = recon.nrmse(zr[h][:, span], Z[h][:, span])
+            ax.text(0.98, 0.9, f"{tot:.0f}%", transform=ax.transAxes, ha="right", va="top", bbox=dict(fc="white", ec="none", alpha=0.85, pad=0.8))
+            ax.set_yticks(np.arange(len(names)) + 0.5); ax.set_yticklabels(names if j == 0 else []); ax.tick_params(axis="y", length=0, labelsize=6.5)
+            ax.set_xticks([])
+            if i == 0: ax.set_title(LAB[a], pad=3)
+            if j == len(ARMS) - 1: ax.text(1.04, 0.5, f"N = {N}", transform=ax.transAxes, ha="left", va="center")
+            if i == len(NS) - 1:
+                ax.set_xticks([150, 250, 350, 450] if PROBE == "soft" else [50, 100, 150, 200])
+                if j == 1: ax.set_xlabel("distance from clamp x (µm)")
+            if i == 0 and j == 0: S.label(ax, "b", dx=-0.32, dy=1.25)
+    pos = fig.axes[-1].get_position()
+    cax = fig.add_axes([0.955, 0.705, 0.01, 0.17])
+    cb = fig.colorbar(ims, cax=cax); cb.set_label("error (% of band RMS)"); cb.set_ticks([0, 20, 40, 60]); cb.set_ticklabels(["0", "20", "40", "≥60"])
+    def panel_rows(gsr, kind, letter):
+        g = gsr.subgridspec(len(SHOW_N), len(SHOW_BANDS), hspace=0.14, wspace=0.12)
+        for i, N in enumerate(SHOW_N):
+            for j, b in enumerate(SHOW_BANDS):
+                ax = fig.add_subplot(g[i, j]); m = masks[b]
+                if kind == "spec":
+                    fk = f[m] / 1e3; ref = np.abs(Z[ipos][m]).max(); db = lambda z: 20 * np.log10(np.abs(z) / ref + 1e-6)
+                    ax.plot(fk, db(Z[ipos][m]), color="k", lw=1.0)
+                    sd = out["sd"][N][ipos][m]; zg = np.abs(out["Zrec"][N]["EB+GP"][ipos][m])
+                    ax.fill_between(fk, db(np.clip(zg - 2 * sd, 1e-9, None)), db(zg + 2 * sd), color=S.MAP, alpha=0.2, lw=0)
+                    for a in ARMS:
+                        ax.plot(fk, db(out["Zrec"][N][a][ipos][m]), LS[a], color=COL[a], lw=0.9)
+                    ax.set_ylim(-42, 4); ax.set_xlim(fk.min(), fk.max())
+                    if j == 0 and i == len(SHOW_N) - 1: ax.set_ylabel("|Z| (dB re peak)"); ax.yaxis.set_label_coords(-0.2, 1.06)
+                    xl_ = "frequency (kHz)"; ttl = b
+                else:
+                    f0, prof = spectra.on_resonance_profile(f, Z, bands[b]); jf = int(np.argmin(np.abs(f - f0)))
+                    a0 = np.abs(Z[:, jf]); nrm = a0.max()
+                    ax.plot(x, a0 / nrm, color="k", lw=1.0)
+                    sd = out["sd"][N][:, jf]; zg = np.abs(out["Zrec"][N]["EB+GP"][:, jf])
+                    ax.fill_between(x, np.clip(zg - 2 * sd, 0, None) / nrm, (zg + 2 * sd) / nrm, color=S.MAP, alpha=0.2, lw=0)
+                    for a in ARMS:
+                        ax.plot(x, np.abs(out["Zrec"][N][a][:, jf]) / nrm, LS[a], color=COL[a], lw=0.9)
+                    ax.plot(x[out["sel"][N]], a0[out["sel"][N]] / nrm, "v", color="k", ms=3, mec="none", zorder=5)
+                    ax.set_ylim(0, 1.4); ax.set_xlim(x.min(), x.max()); ax.set_yticks([0, 0.5, 1])
+                    if j == 0 and i == len(SHOW_N) - 1: ax.set_ylabel("|Z| (norm.)"); ax.yaxis.set_label_coords(-0.2, 1.06)
+                    xl_ = "distance from clamp x (µm)"; ttl = f"{b}, {f0/1e3:.0f} kHz"
+                if j: ax.set_yticklabels([])
+                if j == len(SHOW_BANDS) - 1: ax.text(1.04, 0.5, f"N = {N}", transform=ax.transAxes, ha="left", va="center")
+                if i == 0: ax.set_title(ttl, pad=2); ax.set_xticklabels([])
+                else: ax.set_xlabel(xl_)
+                if i == 0 and j == 0: S.label(ax, letter, dx=-0.3, dy=1.12)
+                if i == 0 and j == 1 and kind == "spec": ax.text(0.5, 1.3, f"at an omitted position, x = {x[ipos]:.0f} µm (dotted line in a)", transform=ax.transAxes, ha="center")
+    panel_rows(gs[2], "spec", "c"); panel_rows(gs[3], "shape", "d")
+    handles = [Line2D([], [], color="k", lw=1, label="measured (dense)")] + \
+              [Line2D([], [], color=COL[a], ls=LS[a], lw=1, label=LAB[a]) for a in ARMS] + \
+              [Patch(fc=S.MAP, alpha=0.2, label="hybrid ±2σ"), Line2D([], [], marker="v", color="k", ls="", ms=3.5, label="sampled positions")]
+    axl = fig.add_subplot(gs[1]); axl.axis("off")
+    axl.legend(handles=handles, loc="center", ncol=6, handlelength=2.0, columnspacing=1.4)
+    S.save(fig, name, formats=("png", "pdf"))   # SVG of the dense spectra exceeds memory; the PDF is vector
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--replot", action="store_true"); ap.add_argument("--probe", default="soft", choices=PROBES)
-    ap.add_argument("--err_scale", default="log", choices=["log", "linear"])
+    ap.add_argument("--err_scale", default="log", choices=["log", "linear"]); ap.add_argument("--v3", action="store_true")
     a = ap.parse_args(); PROBE = a.probe
     if a.replot and CACHE().exists():
         out = load()
     else:
         out = compute(); save(out)
-    plot(out, F.config.FIG_DIR / f"fig_recovery_vs_N_{PROBE}{'' if a.err_scale == 'log' else '_linear'}.png", err_scale=a.err_scale)
+    ap2 = a
+    if getattr(ap2, "v3", False):
+        plot_v3(out, f"Fig2_sparse_reconstruction_{PROBE}")
+    else:
+        plot(out, F.config.FIG_DIR / f"fig_recovery_vs_N_{PROBE}{'' if a.err_scale == 'log' else '_linear'}.png", err_scale=a.err_scale)

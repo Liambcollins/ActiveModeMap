@@ -19,7 +19,7 @@ from scipy.ndimage import uniform_filter1d
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fmmpaper as F  # noqa: E402
-from fmmpaper import spectra, schematic, plotting as fp  # noqa: E402
+from fmmpaper import spectra, schematic, plotting as fp, style3 as S3  # noqa: E402
 
 X0 = {"stiff": 28.1, "soft": -19.0}
 TIMES = pd.DataFrame([dict(probe="soft probe", dense_min=410.6, n_dense=346, sparse_min=13.8, n_sparse=12),
@@ -77,62 +77,105 @@ def load(probe):
     s = F.load(key); return dict(s=s, x=s.x_um - X0[probe], f=s.freq_Hz, Z=s.Z[0], bands=dict(s.probe.bands_Hz))
 
 
-def plot(path):
-    fp.setup()
+def plot(path, cmap=fp.MAP_CMAP, ink="w", formats=("png", "pdf"), fontsize=None):
+    """ink: colour of band labels and the sweep-position line drawn on the maps (use "k" on light colormaps)."""
+    S3.setup() if fontsize else fp.setup()
+    if fontsize:
+        plt.rcParams.update({k: fontsize for k in ("font.size", "axes.titlesize", "axes.labelsize", "xtick.labelsize", "ytick.labelsize", "legend.fontsize")})
     S, T = load("soft"), load("stiff")
-    W = fp.WIDTH_IN["double"]; fig = plt.figure(figsize=(W, W * 0.92))
-    gs = fig.add_gridspec(3, 1, height_ratios=[0.42, 1.15, 0.85], hspace=0.38)
+    W = fp.WIDTH_IN["double"]; fig = plt.figure(figsize=(W, W * (1.05 if fontsize else 0.92)))
+    gs = fig.add_gridspec(3, 1, height_ratios=[0.58 if fontsize else 0.42, 1.15, 0.85], hspace=0.45 if fontsize else 0.38)
     # (a) schematic
     axa = fig.add_subplot(gs[0]); schematic.draw(axa); fp.panel_label(axa, "a", dx=0.0, dy=0.95)
     # (b, c) maps
     g1 = gs[1].subgridspec(1, 3, width_ratios=[1.55, 1.0, 0.035], wspace=0.22)
     axb = fig.add_subplot(g1[0, 0]); axc = fig.add_subplot(g1[0, 1])
-    im = fp.map_db(axb, S["x"], S["f"], S["Z"], fmin=40, fmax=1090, colorbar=False)
-    for b in S["bands"]:
-        axb.text(S["x"].max() - 3, np.mean(S["bands"][b]) / 1e3 + 12, b, color="w", fontsize=5.5, ha="right", va="bottom")
+    im = fp.map_db(axb, S["x"], S["f"], S["Z"], fmin=40, fmax=1090, colorbar=False, cmap=cmap)
+    def band_labels(ax, D, fmax, dy):
+        xr = D["x"].max() - 0.015 * np.ptp(D["x"]); names = list(D["bands"])
+        for b in names:
+            fc = np.mean(D["bands"][b]) / 1e3; top = (b == names[-1]) and (fontsize or fc + 4 * dy > fmax)
+            if fontsize:  # offset in points so the label clears the resonance line at any font size
+                ax.annotate(b, (xr, fc), xytext=(0, -4 if top else 4), textcoords="offset points", color=ink, fontsize=5.5, ha="right", va="top" if top else "bottom")
+            else:
+                ax.text(xr, fc - dy if top else fc + dy, b, color=ink, fontsize=5.5, ha="right", va="top" if top else "bottom")
+    band_labels(axb, S, 1090, 12)
     axb.set_title("soft probe · 346 positions, 1 µm pitch · 411 min", fontsize=6.5)
     axb.set_xlabel("distance from clamp x (µm)"); axb.set_ylabel("frequency (kHz)")
-    fp.map_db(axc, T["x"], T["f"], T["Z"], fmin=240, fmax=1910, colorbar=False)
-    for b in T["bands"]:
-        axc.text(T["x"].max() - 3, np.mean(T["bands"][b]) / 1e3 + 25, b, color="w", fontsize=5.5, ha="right", va="bottom")
+    fp.map_db(axc, T["x"], T["f"], T["Z"], fmin=240, fmax=1910, colorbar=False, cmap=cmap)
+    band_labels(axc, T, 1910, 25)
     axc.set_title("stiff probe · 161 positions · 192 min", fontsize=6.5); axc.set_xlabel("distance from clamp x (µm)"); axc.set_ylabel("")
+    if fontsize:
+        S3.boxes(axb); S3.boxes(axc)
     cb = fig.colorbar(im, cax=fig.add_subplot(g1[0, 2])); cb.set_label("|Z| (dB re max)", fontsize=6)
     fp.panel_label(axb, "b", dx=-0.1); fp.panel_label(axc, "c", dx=-0.1)
     # (d) single sweep, (e) fixed-frequency profiles, (f) timing
-    g2 = gs[2].subgridspec(1, 3, width_ratios=[1.1, 1.1, 0.8], wspace=0.4)
+    g2 = gs[2].subgridspec(1, 3, width_ratios=[1.1, 1.1, 0.8], wspace=0.4) if not fontsize else gs[2].subgridspec(1, 3, width_ratios=[0.95, 1.5, 0.8], wspace=0.42)
     axd, axe, axf = (fig.add_subplot(g2[0, i]) for i in range(3))
     ipos = int(np.argmin(np.abs(S["x"] - 300))); ref = np.abs(S["Z"]).max()
     axd.plot(S["f"] / 1e3, 20 * np.log10(np.abs(S["Z"][ipos]) / ref + 1e-9), color="k", lw=0.6)
     axd.set_xlim(40, 1090); axd.set_ylim(-75, 3); axd.set_xlabel("frequency (kHz)"); axd.set_ylabel("|Z| (dB re max)")
-    axd.set_title(f"one conventional sweep, x = {S['x'][ipos]:.0f} µm", fontsize=6.5)
-    axb.axvline(S["x"][ipos], color="w", lw=0.5, ls="--")
+    axd.set_title(("" if fontsize else "one ") + f"conventional sweep, x = {S['x'][ipos]:.0f} µm", fontsize=6.5)
+    axb.axvline(S["x"][ipos], color=ink, lw=0.5, ls="--")
     for b in S["bands"]:
         pk = spectra.peak(S["f"], S["Z"][ipos], S["bands"][b])
-        axd.text(pk["f_Hz"] / 1e3 + 15, 20 * np.log10(pk["amp"] / ref) - 2, b, fontsize=5, ha="left", va="top", color="0.3")
+        last = b == list(S["bands"])[-1]
+        axd.text(pk["f_Hz"] / 1e3 + (-15 if last else 15), 20 * np.log10(pk["amp"] / ref) - 2, b, fontsize=5, ha="right" if last else "left", va="top", color="0.3")
     # profiles: CR1, CR3, CR5 on resonance, plus one antiresonance branch frequency
     picks = [("CR1", None), ("CR3", None), ("CR5", None)]
-    cols = {"CR1": fp.C["cr1"], "CR3": fp.C["cr3"], "CR5": fp.C["cr5"]}
+    cols = {"CR1": S3.CR1, "CR3": S3.QS, "CR5": S3.MODEL} if fontsize else {"CR1": fp.C["cr1"], "CR3": fp.C["cr3"], "CR5": fp.C["cr5"]}
     for b, _ in picks:
         f0, v = spectra.on_resonance_profile(S["f"], S["Z"], S["bands"][b]); a = np.abs(v) / np.abs(v).max()
         axe.plot(S["x"], a, color=cols[b], lw=0.9, label=f"{b}, {f0/1e3:.0f} kHz")
     # antiresonance: a frequency in the CR3-CR4 gap where the branch sweeps across the lever
     far = antiresonance_branches(S["x"], S["f"], S["Z"], S["bands"])[2][1]      # gap CR3-CR4
     f_ar = float(np.nanmedian(far)); j = int(np.argmin(np.abs(S["f"] - f_ar))); a = np.abs(S["Z"][:, j]); a = a / a.max()
-    axe.plot(S["x"], a, color="0.35", lw=0.9, ls="--", label=f"{f_ar/1e3:.0f} kHz (antiresonance branch)")
+    axe.plot(S["x"], a, color="0.35", lw=0.9, ls="--", label=f"{f_ar/1e3:.0f} kHz, antiresonance")
     axe.set_xlim(S["x"].min(), S["x"].max()); axe.set_ylim(0, 1.25); axe.set_xlabel("distance from clamp x (µm)"); axe.set_ylabel("|Z| at fixed f (norm.)")
-    axe.legend(fontsize=5.2, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=2, handlelength=1.5, columnspacing=0.8, frameon=False)
+    if fontsize:  # legend inside, in headroom above the normalised profiles
+        axe.set_ylim(0, 1.5); axe.set_yticks(np.arange(0, 1.01, 0.2))
+        axe.legend(loc="upper center", ncol=2, handlelength=0.9, handletextpad=0.35, columnspacing=0.5, borderaxespad=0.2, frameon=False)
+    else:
+        axe.legend(fontsize=5.2, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=2, handlelength=1.5, columnspacing=0.8, frameon=False)
+    if fontsize:
+        axd.set_xticks(np.arange(200, 1001, 200))
     yy = np.arange(len(TIMES))
-    axf.barh(yy + 0.19, TIMES.dense_min, height=0.36, color="0.6", label="dense reference")
-    axf.barh(yy - 0.19, TIMES.sparse_min, height=0.36, color=fp.C["ebgp"], label="live sparse capture")
+    axf.barh(yy + 0.19, TIMES.dense_min, height=0.36, color=S3.LIGHT if fontsize else "0.6", label="dense reference")
+    axf.barh(yy - 0.19, TIMES.sparse_min, height=0.36, color=S3.MAP if fontsize else fp.C["ebgp"], label="live sparse capture")
     for i, r in TIMES.iterrows():
         axf.text(r.sparse_min * 1.15, i - 0.19, f"N = {r.n_sparse}: ×{r.dense_min / r.sparse_min:.0f} faster", va="center", fontsize=5.5)
         axf.text(r.dense_min * 1.15, i + 0.19, f"N = {r.n_dense}", va="center", fontsize=5.5, color="0.35")
     axf.set_xscale("log"); axf.set_xlim(3, 3e4); axf.set_ylim(1.5, -0.9); axf.set_yticks(yy); axf.set_yticklabels(TIMES.probe, fontsize=6)
-    axf.set_xlabel("acquisition time (min)"); axf.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), fontsize=5.2, handlelength=1.2, frameon=False, ncol=1)
+    if fontsize:
+        axf.set_xticks([1e1, 1e2, 1e3, 1e4])
+    axf.set_xlabel("acquisition time (min)"); axf.legend(loc="lower left" if fontsize else "lower center", bbox_to_anchor=(-0.02 if fontsize else 0.5, 1.0), fontsize=5.2, handlelength=1.2, frameon=False, ncol=1)
     for ax, lab in ((axd, "d"), (axe, "e"), (axf, "f")):
         fp.panel_label(ax, lab, dx=-0.18 if lab != "f" else -0.3)
-    fig.savefig(path, dpi=600); fig.savefig(str(path).replace(".png", ".pdf")); plt.close(fig); print("wrote", path)
+    if fontsize:  # schematic: move "tip" right of the tip so it clears the distance-axis label
+        for t in axa.texts:
+            if t.get_text() == "tip":
+                x, _ = t.get_position(); t.set_position((x + 0.85, -0.42)); t.set_ha("left")
+            elif t.get_text().startswith("V$_{dc}$"):
+                x, _ = t.get_position(); t.set_position((x, -1.05))
+    if fontsize:  # raise every non-bold text (ticks, labels, legends, annotations, schematic) to one size
+        for t in fig.findobj(matplotlib.text.Text):
+            if t.get_text() and t.get_fontweight() != "bold":
+                t.set_fontsize(fontsize)
+    path = Path(path)
+    for ext in formats:
+        out = path.with_suffix("." + ext); fig.savefig(out, dpi=600); print("wrote", out)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
-    plot(F.config.FIG_DIR / "Fig1_concept.png")
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cmap", default=fp.MAP_CMAP)
+    ap.add_argument("--ink", default=None, help="label/line colour on the maps (default: w for magma, k otherwise)")
+    ap.add_argument("--out", default=None, help="output path stem (default figures/Fig1_concept[_<cmap>])")
+    ap.add_argument("--formats", default="png,pdf")
+    ap.add_argument("--fontsize", type=float, default=None, help="set all text to this size (7 = Nature max)")
+    a = ap.parse_args()
+    ink = a.ink or ("w" if a.cmap == fp.MAP_CMAP else "k")
+    out = a.out or F.config.FIG_DIR / ("Fig1_concept" + ("" if a.cmap == fp.MAP_CMAP else f"_{a.cmap}") + ".png")
+    plot(out, cmap=a.cmap, ink=ink, formats=tuple(a.formats.split(",")), fontsize=a.fontsize)

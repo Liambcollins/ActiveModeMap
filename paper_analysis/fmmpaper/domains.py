@@ -74,8 +74,12 @@ def decompose_series(s: Series, band=None, spots=(1, 2)) -> dict:
 
 
 def transfer_table(s: Series, invols_fn, vac_V: float, cr_band="CR1", spots=(1, 2),
-                   ref_bias: float = 0.0) -> pd.DataFrame:
+                   ref_bias: float = 0.0, track: bool = False) -> pd.DataFrame:
     """Per-position channel table: the core of the 'E is not Q' result.
+
+    ``track=True``: every bias condition is read at its OWN CR peak (complex value at the peak bin)
+    before the decomposition, and Q is the median over conditions. Use it when the resonance moves
+    between bias conditions by more than a fraction of the linewidth (Adama: 2-8 kHz vs 2-5 kHz).
 
     For each position:
       * QS channel: complex mean over the quasi-static band, per condition -> decompose
@@ -93,13 +97,19 @@ def transfer_table(s: Series, invols_fn, vac_V: float, cr_band="CR1", spots=(1, 
         zq = s.Z[:, j, qm].mean(-1)
         dq = decompose(V1, zq[i1], V2, zq[i2])
         pk = peak(s.freq_Hz, s.Z[iref, j], band)
-        zc = s.Z[:, j, pk["k"]]
+        if track:
+            pks = [peak(s.freq_Hz, s.Z[c, j], band) for c in range(s.Z.shape[0])]
+            zc = np.array([q["z"] for q in pks])
+            pk = dict(pk, Q=float(np.nanmedian([q["Q"] for q in pks])),
+                      f_spread_Hz=float(np.ptp([q["f_Hz"] for q in pks])))
+        else:
+            zc = s.Z[:, j, pk["k"]]
         dc = decompose(V1, zc[i1], V2, zc[i2])
         inv = float(invols_fn(x))
         conv = inv / s.probe.amp_divisor / vac_V * 1e12       # raw V -> pm/V
         rows.append(dict(
             x_um=float(x), x_clamp_um=float(x - s.probe.clamp_offset_um), invols=inv,
-            f_cr_Hz=pk["f_Hz"], Q=pk["Q"],
+            f_cr_Hz=pk["f_Hz"], Q=pk["Q"], f_cr_spread_Hz=pk.get("f_spread_Hz", 0.0),
             P_qs=float(abs(dq["P"])), P_cr=float(abs(dc["P"])),
             E=float(abs(dc["P"]) / abs(dq["P"])),
             vcpd_qs=float(dq["v_cpd"]), vcpd_cr=float(dc["v_cpd"]),

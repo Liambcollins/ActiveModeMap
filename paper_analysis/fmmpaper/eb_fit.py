@@ -21,9 +21,12 @@ from . import config
 config.ensure_activemodemap()
 from activemodemap.forward_model import EBForwardModel, ProbeGeometry  # noqa: E402
 
-PARAMS = ("log_alpha", "log_kcone", "setback_um", "log_zeta", "tip_height_um")
+PARAMS = ("log_alpha", "log_kcone", "setback_um", "log_zeta", "tip_height_um", "f0_scale")
 LO = np.array([1.5, 0.0, 0.3, -3.5, 5.0])
 HI = np.array([5.0, 4.0, 40.0, -1.0, 25.0])
+# optional 6th parameter: free-beam frequency scale f0_eff / f0_measured. The measured free f0 includes the tip
+# mass (which the contact modes barely see); on a diamond-tip probe the two differ by several %.
+F0_SCALE_BOUNDS = (0.92, 1.15)
 
 
 @dataclass
@@ -40,8 +43,9 @@ class ContactState:
 
 
 def _model(p, st: ContactState, f_list):
-    la, lk, sb, lz, th = p
-    g = ProbeGeometry(name="SCM-PIT", f0_hz=st.f0_free_Hz, k_lever=st.k_lever, L_um=st.L_um,
+    la, lk, sb, lz, th = p[:5]
+    f0s = p[5] if len(p) > 5 else 1.0
+    g = ProbeGeometry(name="SCM-PIT", f0_hz=st.f0_free_Hz * f0s, k_lever=st.k_lever, L_um=st.L_um,
                       tip_setback_um=sb, tip_height_um=th, tilt_deg=11.0)
     m = EBForwardModel(geom=g, n_modes=14, nx=453, nf=2)
     m.omega = np.asarray(f_list, float) / m.freq_scale_hz
@@ -49,18 +53,25 @@ def _model(p, st: ContactState, f_list):
     return m, m.response(np.array([la, lk, 2.3, 0.0, 0.0, lz]))
 
 
-def peaks(p, st, f_lo=150e3, f_hi=2.1e6, n=2500):
+def peaks(p, st, f_lo=None, f_hi=None, n=2500):
+    """The first n_cr model contact resonances (n_cr = number of measured CRs in st, default 3).
+    The search window and the minimum peak separation scale with the measured CR1 so the same code
+    serves the soft lever (CR1 ~ 65 kHz) and the stiff ones (CR1 ~ 300 kHz)."""
+    cr = np.asarray(st.cr_Hz, float); n_cr = int(cr.size) if cr.size and np.all(cr > 0) else 3
+    if f_lo is None: f_lo = 0.5 * cr[0] if n_cr and np.all(cr > 0) else 150e3
+    if f_hi is None: f_hi = 1.25 * cr[-1] if n_cr and np.all(cr > 0) else 2.1e6
+    sep = 0.2 * cr[0] if np.all(cr > 0) else 60e3
     m, r = _model(p, st, np.linspace(f_lo, f_hi, n))
     i = np.argmin(np.abs(m.xi - 0.55)); a = np.abs(r["piezo"][:, i])
     pk = sorted([k for k in range(1, a.size - 1) if a[k] >= a[k - 1] and a[k] >= a[k + 1]],
                 key=lambda k: -a[k])
     out = []
     for k in pk:
-        if all(abs(m.f_hz[k] - m.f_hz[o]) > 60e3 for o in out):
+        if all(abs(m.f_hz[k] - m.f_hz[o]) > sep for o in out):
             out.append(k)
-        if len(out) == 3:
+        if len(out) == n_cr:
             break
-    return np.sort(m.f_hz[out]) if len(out) == 3 else None
+    return np.sort(m.f_hz[out]) if len(out) == n_cr else None
 
 
 def model_nodes(p, st, f_mode):
@@ -98,7 +109,7 @@ def residual(p, st: ContactState, use_nodes=True, node_scale_um=100.0, sig_f=Non
     fk = peaks(p, st)
     n_nodes = sum(len(v) for v in st.nodes_um.values()) if use_nodes else 0
     if fk is None:
-        return np.full(3 + st.x_static_um.size + 1 + n_nodes, 5.0 * max(wf, ws, wq) / 3)
+        return np.full(len(st.cr_Hz) + st.x_static_um.size + 1 + n_nodes, 5.0 * max(wf, ws, wq) / 3)
     zq = static_shape(p, st, st.x_static_um)
     y = 1.0 / st.invols_static
     g = np.sum(y * zq) / np.sum(zq * zq)
@@ -106,7 +117,7 @@ def residual(p, st: ContactState, use_nodes=True, node_scale_um=100.0, sig_f=Non
     r_Q = wq * np.log(q_model(p, st, fk[0]) / st.Q1)
     r = [wf * np.log(fk / st.cr_Hz), r_static, [r_Q]]
     if use_nodes:
-        for k, mode in ((1, "CR2"), (2, "CR3")):
+        for k, mode in [(j, f"CR{j+1}") for j in range(1, len(fk))]:
             meas = st.nodes_um.get(mode, [])
             if not meas:
                 continue
@@ -117,10 +128,13 @@ def residual(p, st: ContactState, use_nodes=True, node_scale_um=100.0, sig_f=Non
     return np.concatenate([np.atleast_1d(v) for v in r])
 
 
-def fit(st: ContactState, use_nodes=True, starts=None, max_nfev=80, verbose=False, lo=None, hi=None, **wkw):
+def fit(st: ContactState, use_nodes=True, starts=None, max_nfev=80, verbose=False, lo=None, hi=None, free_f0=False, **wkw):
     lo = LO if lo is None else np.asarray(lo, float); hi = HI if hi is None else np.asarray(hi, float)
     starts = starts or [[la, lk, 5.0, np.log10(2e-3), th]
                         for la in (2.4, 2.8, 3.2) for lk in (1.0, 2.0, 3.0) for th in (10.0, 15.0)]
+    if free_f0:
+        lo = np.append(lo[:5], F0_SCALE_BOUNDS[0]); hi = np.append(hi[:5], F0_SCALE_BOUNDS[1])
+        starts = [list(p0[:5]) + [1.0] for p0 in starts]
     best = None
     for p0 in starts:
         try:
@@ -138,12 +152,12 @@ def fit(st: ContactState, use_nodes=True, starts=None, max_nfev=80, verbose=Fals
 def summarize(p, st: ContactState) -> dict:
     fk = peaks(p, st)
     out = dict(state=st.name, k_ratio=10 ** p[0], kcone_ratio=10 ** p[1], setback_um=p[2],
-               zeta=10 ** p[3], tip_height_um=p[4],
+               zeta=10 ** p[3], tip_height_um=p[4], f0_scale=(p[5] if len(p) > 5 else 1.0),
                cr_model_kHz=(fk / 1e3).round(2).tolist() if fk is not None else None,
                cr_err_pct=(100 * (fk / st.cr_Hz - 1)).round(2).tolist() if fk is not None else None,
                Q_model=q_model(p, st, fk[0]) if fk is not None else None, Q_meas=st.Q1)
     if fk is not None:
-        out["nodes_model_um"] = {"CR2": model_nodes(p, st, fk[1]), "CR3": model_nodes(p, st, fk[2])}
+        out["nodes_model_um"] = {f"CR{j+1}": model_nodes(p, st, fk[j]) for j in range(1, len(fk))}
         out["nodes_meas_um"] = st.nodes_um
     zq = static_shape(p, st, st.x_static_um); y = 1 / st.invols_static
     g = np.sum(y * zq) / np.sum(zq * zq)
