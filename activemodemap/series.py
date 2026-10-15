@@ -158,8 +158,14 @@ def run_series(instrument, x_grid_um, conditions, ref_index=None, rank=4,
                min_positions=None, max_positions=20, dns_band_Hz=None,
                dns_ci_tol_um=1.0, stable_over=3, start_near_um=None,
                checkpoint_path=None, resume=True, verbose=True,
-               positions_um=None):
+               positions_um=None, on_position=None, should_stop=None):
     """Active-learning position selection, measuring every condition per position.
+
+    `on_position(series_so_far)` is called after every completed position with
+    the packed dict (`x_um`, `freq_Hz`, `Z`, `conditions`) — this is the hook a
+    live plot or a GUI uses. `should_stop()` is polled before every position; when
+    it returns True the loop ends cleanly (checkpoint written, nothing lost).
+    Both default to None and the behaviour is unchanged without them.
 
     `positions_um`: a FIXED design instead of active learning. The positions are
     measured in the order given (already-measured ones are skipped on resume),
@@ -226,6 +232,10 @@ def run_series(instrument, x_grid_um, conditions, ref_index=None, rank=4,
     consecutive_failures = 0
     failed_x = set()
     while mm.n < max_positions or (fixed is not None and any(v not in measured for v in fixed)):
+        if should_stop is not None and should_stop():
+            if verbose:
+                print("\nstop requested — checkpoint holds everything up to here")
+            break
         if fixed is not None:
             todo = [v for v in fixed if v not in measured and v not in failed_x]
             if not todo:
@@ -269,6 +279,12 @@ def run_series(instrument, x_grid_um, conditions, ref_index=None, rank=4,
                               if v is not None}
         f_ref, Z_ref = got[ref_index][0], got[ref_index][1]
         mm.add_measurement(float(x), f_ref, Z_ref)
+
+        if on_position is not None:
+            try:
+                on_position(_pack(measured, conditions, ref_index))
+            except Exception as e:          # a plotting error must never stop the instrument
+                print(f"  (on_position callback failed: {type(e).__name__}: {e})")
 
         if fixed is not None:
             if checkpoint_path:

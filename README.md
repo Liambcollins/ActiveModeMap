@@ -55,11 +55,13 @@ activemodemap/            core library
   lowrank.py              model-light low-rank reconstruction (+ online manager)
   online.py               Instrument abstraction, VirtualInstrument, live plotting
   asylum.py               Asylum/Igor control + AsylumInstrument (Windows only)
+  smm/                    operational SMM workflow: config, stages, map-route analysis, live view
 notebooks/
   00_reference_dense_sweep_asylum.ipynb   original dense-sweep automation (reference)
   01_active_loop_dryrun.ipynb             the loop on a VirtualInstrument (no hardware)
   02_reconstruct_dense_data.ipynb         low-rank reconstruction on bundled real data
   03_run_on_instrument.ipynb              >>> run the full loop on the AFM <<<
+  08_smm_calibration.ipynb                >>> calibrated CR-PFM: capture -> E_map(x) -> d_eff <<<
 scripts/                  benchmark + figure-generation scripts
 data/example_1000nN/      bundled 30-position dense sweep (Multi75E-G / PPLN, 1000 nN)
 paper/                    manuscript draft
@@ -101,6 +103,20 @@ for _ in range(max_positions):
         if mm.converged():
             break
 ```
+
+## Operational workflow: `notebooks/08_smm_calibration.ipynb`
+
+The map-route calibration of the SMM paper as one notebook for the instrument: a single
+CONFIG cell, then one cell per stage (connect → pre-flight → two-domain sparse capture with
+a live view → analysis (δ, V_cpd, E_map(x), leave-one-out, QS electrostatic blind spot) →
+imaging plan (QS frame at the blind spot, BE frames at chosen interior stops with E_map) →
+per-stop go-to + tune + frames converted to d_eff → close-out). BE acquisition goes through a
+one-function adapter you fill in once (`activemodemap/smm/be_adapter_template.py`). Built on `activemodemap.smm`
+(`config.py`, `stages.py`, `analysis.py`, `live.py`, `instruments.py`, `imaging.py`), pure
+numpy, runs inside the kernel that owns `inst`. Set `VIRTUAL = True` to rehearse the whole
+notebook on an archived survey (`ReplayInstrument`) before touching the microscope.
+Regression tests against the SCM-PIT R2 archive: `pytest tests/test_smm.py`
+(set `SMM_R2_DIR` if the data are not at `D:\ActiveModeMap\DomainsB_SCMPIT_R2`).
 
 ## Notes
 
